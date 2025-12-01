@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1032079216748",
+    "project_id": "goalpocket-9d412",
+    "storage_bucket": "goalpocket-9d412.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1032079216748:android:42896d374bc26200f88849",
+        "android_client_info": {
+          "package_name": "com.goalpocket.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBpEMkUzL2HluuggtglGpjnALW5QLuVBng"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
