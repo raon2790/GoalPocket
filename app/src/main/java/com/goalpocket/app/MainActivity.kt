@@ -1844,8 +1844,8 @@ fun CategorySettingsScreen(
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    val versionName = "1.0.0"
-    val versionCode = 1
+    val versionName = "1.1.0"
+    val versionCode = 2
 
     Scaffold(
         topBar = {
@@ -1874,7 +1874,7 @@ fun AboutAppScreen(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "GoalPocket v$versionName (빌드 $versionCode)",
+                text = "GoalPocket v$versionName (Build $versionCode)",
                 style = MaterialTheme.typography.bodyMedium
             )
 
@@ -1901,16 +1901,15 @@ fun AboutAppScreen(
             Divider()
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 3. 간단 사용법 안내
             Text(
-                text = "앱 사용 안내",
+                text = "변경사항",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "• 홈 탭에서 이번 달 수입/지출 합계를 확인할 수 있습니다.\n" +
-                        "• 카테고리는 설정 → 카테고리 관리에서 추가/삭제할 수 있습니다.\n" +
-                        "• 캘린더 탭에서는 날짜별로 수입/지출 내역과 합계를 볼 수 있습니다.",
+                text = "• 이제 네비게이션바를 통해 손쉽게 탭을 옮겨다닐 수 있습니다..\n" +
+                        "• 이제 카테고리를 설정에서 손쉽게 관리할 수 있습니다.\n" +
+                        "• 이제 앱의 변경사항을 앱 정보에서 확인할 수 있습니다.",
                 style = MaterialTheme.typography.bodyMedium
             )
         }
