@@ -1844,8 +1844,8 @@ fun CategorySettingsScreen(
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    val versionName = "1.1.0"
-    val versionCode = 2
+    val versionName = "1.1.2"
+    val versionCode = 4
 
     Scaffold(
         topBar = {
@@ -1907,7 +1907,7 @@ fun AboutAppScreen(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "• 이제 네비게이션바를 통해 손쉽게 탭을 옮겨다닐 수 있습니다..\n" +
+                text = "• 이제 내비게이션바를 통해 손쉽게 탭을 옮겨다닐 수 있습니다.\n" +
                         "• 이제 카테고리를 설정에서 손쉽게 관리할 수 있습니다.\n" +
                         "• 이제 앱의 변경사항을 앱 정보에서 확인할 수 있습니다.",
                 style = MaterialTheme.typography.bodyMedium
