@@ -9,6 +9,8 @@ package com.goalpocket.app
 //TODO: 전월/전년 대비 비교
 //TODO: 검색/필터
 //TODO: 정기 결제 등록
+//TODO: 앱 잠금
+//TODO: 숨김 카테고리
 
 import android.os.Bundle
 import android.util.Log
@@ -47,6 +49,8 @@ import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.rememberDatePickerState
 import kotlinx.coroutines.launch
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
 
 // 날짜 포맷
 fun formatDate(ts: Timestamp?): String {
@@ -390,43 +394,53 @@ fun HomeScreen(
     var selectedYear by remember { mutableStateOf(now.get(Calendar.YEAR)) }
     var selectedMonth by remember { mutableStateOf(now.get(Calendar.MONTH)) }
 
-    // 하단 탭 상태: 0=홈, 1=카테고리, 2=캘린더
     var selectedTab by remember { mutableStateOf(0) }
 
-    // Firestore 로드
-    LaunchedEffect(uid) {
-        if (uid == null) return@LaunchedEffect
+    // 🔹 트랜잭션 실시간 구독
+    DisposableEffect(uid) {
+        if (uid == null) {
+            transactions = emptyList()
+            onDispose { }
+        } else {
+            isLoading = true
 
-        isLoading = true
+            val registration: ListenerRegistration =
+                db.collection("users")
+                    .document(uid)
+                    .collection("transactions")
+                    .orderBy("date", Query.Direction.DESCENDING)
+                    .limit(300)
+                    .addSnapshotListener { snapshot, e ->
+                        if (e != null) {
+                            isLoading = false
+                            Log.e("HomeScreen", "snapshot error", e)
+                            Toast.makeText(
+                                context,
+                                "내역 불러오기 실패: ${e.localizedMessage}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@addSnapshotListener
+                        }
 
-        db.collection("users")
-            .document(uid)
-            .collection("transactions")
-            .orderBy("date", com.google.firebase.firestore.Query.Direction.DESCENDING)
-            .limit(300)
-            .get()
-            .addOnSuccessListener { snapshot ->
-                transactions = snapshot.documents.map { doc ->
-                    TransactionItem(
-                        id = doc.id,
-                        amount = doc.getLong("amount") ?: 0L,
-                        memo = doc.getString("memo") ?: "",
-                        type = doc.getString("type") ?: "",
-                        category = doc.getString("category") ?: "",
-                        date = doc.getTimestamp("date")
-                    )
-                }
-                isLoading = false
+                        if (snapshot != null) {
+                            transactions = snapshot.documents.map { doc ->
+                                TransactionItem(
+                                    id = doc.id,
+                                    amount = doc.getLong("amount") ?: 0L,
+                                    memo = doc.getString("memo") ?: "",
+                                    type = doc.getString("type") ?: "",
+                                    category = doc.getString("category") ?: "",
+                                    date = doc.getTimestamp("date")
+                                )
+                            }
+                            isLoading = false
+                        }
+                    }
+
+            onDispose {
+                registration.remove()
             }
-            .addOnFailureListener { e ->
-                isLoading = false
-                Toast.makeText(
-                    context,
-                    "내역 불러오기 실패: ${e.localizedMessage}",
-                    Toast.LENGTH_SHORT
-                ).show()
-                Log.e("HomeScreen", "load error", e)
-            }
+        }
     }
 
     // 선택된 월 데이터
@@ -450,19 +464,23 @@ fun HomeScreen(
     val netTotal = incomeTotal - expenseTotal
     val monthLabel = "%04d-%02d".format(selectedYear, selectedMonth + 1)
 
-    // 카테고리별 지출 합계
+    // 카테고리별 합계 (수입/지출 모두 포함)
     val categoryTotals = remember(filteredTransactions) {
         filteredTransactions
-            .filter { it.type != "income" }
             .groupBy { it.category.ifBlank { "기타" } }
             .map { (cat, list) ->
+                val total = list.sumOf { tx ->
+                    // 수입은 +, 지출은 - 로 반영
+                    if (tx.type == "income") tx.amount else -tx.amount
+                }
                 CategoryTotal(
                     category = cat,
-                    total = list.sumOf { it.amount }
+                    total = total
                 )
             }
             .sortedByDescending { it.total }
     }
+
 
     Scaffold(
         topBar = {
@@ -566,7 +584,8 @@ fun HomeScreen(
                     year = selectedYear,
                     month = selectedMonth,
                     monthLabel = monthLabel,
-                    monthTransactions = filteredTransactions
+                    monthTransactions = filteredTransactions,
+                    onSelectTransaction = onSelectTransaction   // ✅ 추가
                 )
             }
         }
@@ -690,7 +709,7 @@ fun HomeCategoryTab(
     isLoading: Boolean
 ) {
     Text(
-        text = "카테고리별 지출 합계",
+        text = "카테고리별 합계",
         style = MaterialTheme.typography.titleMedium,
     )
 
@@ -702,7 +721,7 @@ fun HomeCategoryTab(
     }
 
     if (categoryTotals.isEmpty()) {
-        Text("이 달 지출 내역이 없습니다.")
+        Text("이 달 내역이 없습니다.")
         return
     }
 
@@ -711,6 +730,13 @@ fun HomeCategoryTab(
             .fillMaxWidth()
     ) {
         categoryTotals.forEach { ct ->
+            val amountText = formatNetAmount(ct.total)
+            val amountColor = when {
+                ct.total > 0 -> MaterialTheme.colorScheme.primary   // 플러스
+                ct.total < 0 -> MaterialTheme.colorScheme.error     // 마이너스
+                else -> MaterialTheme.colorScheme.onSurface         // 0원
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -722,8 +748,9 @@ fun HomeCategoryTab(
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Text(
-                    text = "₩${"%,d".format(ct.total)}",
-                    style = MaterialTheme.typography.bodyMedium
+                    text = amountText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = amountColor
                 )
             }
             Divider()
@@ -736,7 +763,8 @@ fun HomeCalendarTab(
     year: Int,
     month: Int, // 0~11
     monthLabel: String,
-    monthTransactions: List<TransactionItem>
+    monthTransactions: List<TransactionItem>,
+    onSelectTransaction: (TransactionItem) -> Unit   // ✅ 추가
 ) {
     val dailyTotals: Map<Int, Long> = remember(monthTransactions) {
         monthTransactions.groupBy { tx ->
@@ -766,7 +794,9 @@ fun HomeCalendarTab(
         style = MaterialTheme.typography.titleMedium
     )
 
-    Spacer(modifier = Modifier.height(8.dp))
+    Spacer(modifier = Modifier.height(12.dp))
+    Divider()
+    Spacer(modifier = Modifier.height(12.dp))
 
     val weekDays = listOf("일", "월", "화", "수", "목", "금", "토")
 
@@ -784,7 +814,9 @@ fun HomeCalendarTab(
         }
     }
 
-    Spacer(modifier = Modifier.height(4.dp))
+    Spacer(modifier = Modifier.height(12.dp))
+    Divider()
+    Spacer(modifier = Modifier.height(6.dp))
 
     val cal = Calendar.getInstance().apply {
         set(year, month, 1)
@@ -815,7 +847,12 @@ fun HomeCalendarTab(
                     } else {
                         val today = day
                         val total = dailyTotals[today] ?: 0L
-                        val isSelected = selectedDay == today
+
+                        val amountColor = when {
+                            total > 0 -> MaterialTheme.colorScheme.primary
+                            total < 0 -> MaterialTheme.colorScheme.error
+                            else -> MaterialTheme.colorScheme.onSurface
+                        }
 
                         Column(
                             modifier = Modifier
@@ -835,7 +872,8 @@ fun HomeCalendarTab(
                             if (total != 0L) {
                                 Text(
                                     text = formatNetAmount(total),
-                                    style = MaterialTheme.typography.labelSmall
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = amountColor
                                 )
                             }
                         }
@@ -847,6 +885,8 @@ fun HomeCalendarTab(
     }
 
     Spacer(modifier = Modifier.height(12.dp))
+    Divider()
+    Spacer(modifier = Modifier.height(24.dp))
 
     Text(
         text = if (selectedDay == null)
@@ -863,9 +903,15 @@ fun HomeCalendarTab(
     } else if (selectedDayTransactions.isNotEmpty()) {
         LazyColumn {
             items(selectedDayTransactions) { tx ->
+                val amountText = formatSignedAmount(tx.amount, tx.type)
+                val amountColor =
+                    if (tx.type == "income") MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error
+
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .clickable { onSelectTransaction(tx) }   // ✅ 클릭 시 수정 화면으로
                         .padding(vertical = 6.dp)
                 ) {
                     Row(
@@ -876,7 +922,10 @@ fun HomeCalendarTab(
                             text = tx.memo.ifBlank { "메모 없음" },
                             style = MaterialTheme.typography.bodyLarge
                         )
-                        Text(formatSignedAmount(tx.amount, tx.type))
+                        Text(
+                            text = amountText,
+                            color = amountColor
+                        )
                     }
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
@@ -889,6 +938,7 @@ fun HomeCalendarTab(
         }
     }
 }
+
 
 @Composable
 fun TypeToggleButton(
@@ -1844,8 +1894,8 @@ fun CategorySettingsScreen(
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    val versionName = "1.1.3"
-    val versionCode = 5
+    val versionName = "1.2.0"
+    val versionCode = 6
 
     Scaffold(
         topBar = {
@@ -1902,14 +1952,13 @@ fun AboutAppScreen(
             Spacer(modifier = Modifier.height(24.dp))
 
             Text(
-                text = "변경사항",
+                text = "변경사항 (v$versionName)",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "• 이제 내비게이션바를 통해 손쉽게 탭을 옮겨다닐 수 있습니다.\n" +
-                        "• 이제 카테고리를 설정에서 손쉽게 관리할 수 있습니다.\n" +
-                        "• 이제 앱의 변경사항을 앱 정보에서 확인할 수 있습니다.",
+                text = "• 이제 캘린터 탭에서도 내역을 수정하고 삭제할 수 있습니다.\n" +
+                        "• 카테고리 탭과 캘린터 탭의 금액 색상 표기가 수정되었습니다.",
                 style = MaterialTheme.typography.bodyMedium
             )
         }
