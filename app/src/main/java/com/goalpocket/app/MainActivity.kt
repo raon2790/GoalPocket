@@ -1844,8 +1844,8 @@ fun CategorySettingsScreen(
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    val versionName = "1.1.2"
-    val versionCode = 4
+    val versionName = "1.1.3"
+    val versionCode = 5
 
     Scaffold(
         topBar = {
