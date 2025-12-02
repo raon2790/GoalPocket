@@ -1103,13 +1103,13 @@ fun AddTransactionScreen(
                 }
 
                 if (amountText.isBlank()) {
-                    Toast.makeText(context, "금액 입력해줘", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "금액 입력하세요.", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
 
                 val amount = amountText.toLongOrNull() ?: 0
                 if (amount <= 0) {
-                    Toast.makeText(context, "금액이 올바르지 않아", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "금액이 올바르지 않습니다.", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
 
