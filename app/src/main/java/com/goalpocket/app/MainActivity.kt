@@ -8,7 +8,7 @@ package com.goalpocket.app
 //TODO: 공유 목표 저축
 //TODO: 전월/전년 대비 비교
 //TODO: 검색/필터
-//TODO: 정기 결제 등록
+//aTODO: 정기 결제 등록
 //TODO: 앱 잠금
 //TODO: 숨김 카테고리
 
@@ -18,6 +18,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -26,7 +27,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.rememberDatePickerState
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -38,37 +46,29 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
-import java.util.Calendar
-import kotlin.math.abs
-import androidx.compose.runtime.saveable.rememberSaveable
-import java.util.Date
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
-import androidx.compose.material3.DatePicker
-import androidx.compose.material3.DatePickerDialog
-import androidx.compose.material3.rememberDatePickerState
-import kotlinx.coroutines.launch
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
-import androidx.compose.foundation.border
+import kotlinx.coroutines.launch
+import java.util.Calendar
+import java.util.Date
+import kotlin.math.abs
 
-// 날짜를 "yyyy-MM-dd" 문자열로 포맷팅하는 유틸 함수
+// 공통 날짜 포맷 함수 (Timestamp -> yyyy-MM-dd)
 fun formatDate(ts: Timestamp?): String {
     if (ts == null) return "-"
     val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
     return sdf.format(ts.toDate())
 }
 
-// 수입/지출 타입에 따라 부호를 붙여서 금액을 문자열로 만들어주는 유틸 함수
+// 타입에 따라 부호가 붙은 금액 문자열을 생성
 // ex) income, 10000 -> "+10,000원", expense, 5000 -> "-5,000원"
 fun formatSignedAmount(amount: Long, type: String): String {
     val sign = if (type == "income") "+" else "-"
     return "$sign${"%,d".format(amount)}원"
 }
 
-// 순이익(수입 - 지출)을 표시할 때 사용하는 포맷 함수
-// 양수면 "+"를, 음수면 "-"를 붙이고, 0이면 부호 없이 "0원"만 보여준다
+// 순이익(수입-지출)을 표시용 문자열로 변환
+// 양수: +, 음수: -, 0: 부호 없음
 fun formatNetAmount(net: Long): String {
     val sign = when {
         net > 0 -> "+"
@@ -78,18 +78,17 @@ fun formatNetAmount(net: Long): String {
     return "$sign${"%,d".format(abs(net))}원"
 }
 
-// 앱이 최초 제공하는 기본 카테고리 목록
-// 사용자가 설정 화면에서 커스터마이징하면 Firestore에 저장된 값으로 대체된다
+// 사용자 설정이 없을 때 사용할 기본 카테고리 목록
 fun defaultCategories(): List<String> =
     listOf("식비", "카페", "교통", "쇼핑", "기타")
 
-// 주어진 원본 트랜잭션 리스트를 바탕으로,
-// 특정 연/월에 표시할 내역(정기 결제의 가상 내역 포함)을 만들어준다.
+// 정기결제를 포함해 특정 연/월에 보여줄 내역 리스트를 확장
 fun expandTransactionsForMonth(
     baseTransactions: List<TransactionItem>,
     year: Int,
     month: Int // 0~11
 ): List<TransactionItem> {
+
     val result = mutableListOf<TransactionItem>()
 
     val monthStartCal = Calendar.getInstance().apply {
@@ -101,14 +100,14 @@ fun expandTransactionsForMonth(
     val monthEndCal = (monthStartCal.clone() as Calendar).apply {
         add(Calendar.MONTH, 1)
     }
-    val monthEnd = monthEndCal.timeInMillis // [monthStart, monthEnd) 범위
+    val monthEnd = monthEndCal.timeInMillis
 
     for (tx in baseTransactions) {
         val baseDate = tx.date?.toDate() ?: continue
         val baseMillis = baseDate.time
         val endMillis = tx.recurringEndDate?.toDate()?.time
 
-        // 일반 내역은 해당 달에 들어가면 그대로 추가
+        // 정기결제가 아닌 일반 내역은 해당 월에만 포함
         if (!tx.isRecurring) {
             if (baseMillis in monthStart until monthEnd) {
                 result.add(tx)
@@ -116,58 +115,22 @@ fun expandTransactionsForMonth(
             continue
         }
 
+        val baseCal = Calendar.getInstance().apply { time = baseDate }
+
         when (tx.recurringInterval) {
+
+            // 월 단위 정기결제
             "monthly" -> {
-                val baseCal = Calendar.getInstance().apply { time = baseDate }
-                val baseYear = baseCal.get(Calendar.YEAR)
-                val baseMonth = baseCal.get(Calendar.MONTH)
+                val startYear = baseCal.get(Calendar.YEAR)
+                val startMonth = baseCal.get(Calendar.MONTH)
 
-                // 시작 이전 달이면 스킵
-                if (year < baseYear || (year == baseYear && month < baseMonth)) {
-                    continue
-                }
+                if (year < startYear || (year == startYear && month < startMonth)) continue
 
                 val occCal = Calendar.getInstance().apply {
-                    set(
-                        year,
-                        month,
-                        1,
-                        baseCal.get(Calendar.HOUR_OF_DAY),
-                        baseCal.get(Calendar.MINUTE),
-                        baseCal.get(Calendar.SECOND)
-                    )
-                    set(Calendar.MILLISECOND, baseCal.get(Calendar.MILLISECOND))
-
                     val day = baseCal.get(Calendar.DAY_OF_MONTH)
-                    val maxDay = getActualMaximum(Calendar.DAY_OF_MONTH)
-                    set(Calendar.DAY_OF_MONTH, minOf(day, maxDay))
-                }
-
-                val occMillis = occCal.timeInMillis
-                if (occMillis < baseMillis) continue
-                if (endMillis != null && occMillis > endMillis) continue
-                if (occMillis !in monthStart until monthEnd) continue
-
-                result.add(
-                    tx.copy(
-                        occurrenceDate = Timestamp(Date(occMillis))
-                    )
-                )
-            }
-
-            "yearly" -> {
-                val baseCal = Calendar.getInstance().apply { time = baseDate }
-                val baseYear = baseCal.get(Calendar.YEAR)
-                val baseMonth = baseCal.get(Calendar.MONTH)
-
-                // 연/월이 맞지 않으면 스킵
-                if (month != baseMonth || year < baseYear) continue
-
-                val occCal = Calendar.getInstance().apply {
                     set(
-                        year,
-                        month,
-                        baseCal.get(Calendar.DAY_OF_MONTH),
+                        year, month,
+                        day,
                         baseCal.get(Calendar.HOUR_OF_DAY),
                         baseCal.get(Calendar.MINUTE),
                         baseCal.get(Calendar.SECOND)
@@ -175,55 +138,83 @@ fun expandTransactionsForMonth(
                     set(Calendar.MILLISECOND, baseCal.get(Calendar.MILLISECOND))
 
                     val maxDay = getActualMaximum(Calendar.DAY_OF_MONTH)
-                    if (get(Calendar.DAY_OF_MONTH) > maxDay) {
-                        set(Calendar.DAY_OF_MONTH, maxDay)
-                    }
+                    if (day > maxDay) set(Calendar.DAY_OF_MONTH, maxDay)
                 }
 
                 val occMillis = occCal.timeInMillis
+
                 if (occMillis < baseMillis) continue
                 if (endMillis != null && occMillis > endMillis) continue
                 if (occMillis !in monthStart until monthEnd) continue
 
-                result.add(
-                    tx.copy(
-                        occurrenceDate = Timestamp(Date(occMillis))
-                    )
-                )
+                result.add(tx.copy(occurrenceDate = Timestamp(Date(occMillis))))
             }
 
+            // 연 단위 정기결제
+            "yearly" -> {
+                val startYear = baseCal.get(Calendar.YEAR)
+                val startMonth = baseCal.get(Calendar.MONTH)
+
+                if (month != startMonth) continue
+                if (year < startYear) continue
+
+                val day = baseCal.get(Calendar.DAY_OF_MONTH)
+
+                val occCal = Calendar.getInstance().apply {
+                    set(
+                        year, month,
+                        day,
+                        baseCal.get(Calendar.HOUR_OF_DAY),
+                        baseCal.get(Calendar.MINUTE),
+                        baseCal.get(Calendar.SECOND)
+                    )
+                    set(Calendar.MILLISECOND, baseCal.get(Calendar.MILLISECOND))
+
+                    val maxDay = getActualMaximum(Calendar.DAY_OF_MONTH)
+                    if (day > maxDay) set(Calendar.DAY_OF_MONTH, maxDay)
+                }
+
+                val occMillis = occCal.timeInMillis
+
+                if (occMillis < baseMillis) continue
+                if (endMillis != null && occMillis > endMillis) continue
+                if (occMillis !in monthStart until monthEnd) continue
+
+                result.add(tx.copy(occurrenceDate = Timestamp(Date(occMillis))))
+            }
+
+            // 주 단위 정기결제
             "weekly" -> {
-                val baseCal = Calendar.getInstance().apply { time = baseDate }
+                val baseDow = baseCal.get(Calendar.DAY_OF_WEEK)
 
                 val occCal = Calendar.getInstance().apply {
                     timeInMillis = maxOf(baseMillis, monthStart)
                 }
 
-                // 먼저 같은 요일에 맞춰 이동
-                while (occCal.timeInMillis < monthEnd &&
-                    occCal.get(Calendar.DAY_OF_WEEK) != baseCal.get(Calendar.DAY_OF_WEEK)
+                while (
+                    occCal.timeInMillis < monthEnd &&
+                    occCal.get(Calendar.DAY_OF_WEEK) != baseDow
                 ) {
                     occCal.add(Calendar.DAY_OF_MONTH, 1)
                 }
 
-                // 해당 달 범위 내에서 7일씩 증가시키면서 발생
                 while (occCal.timeInMillis in monthStart until monthEnd) {
                     val occMillis = occCal.timeInMillis
+
                     if (occMillis >= baseMillis &&
                         (endMillis == null || occMillis <= endMillis)
                     ) {
                         result.add(
-                            tx.copy(
-                                occurrenceDate = Timestamp(Date(occMillis))
-                            )
+                            tx.copy(occurrenceDate = Timestamp(Date(occMillis)))
                         )
                     }
+
                     occCal.add(Calendar.DAY_OF_MONTH, 7)
                 }
             }
 
+            // interval이 정의되지 않은 경우: 일반 단일 내역처럼 처리
             else -> {
-                // 정의되지 않은 interval은 그냥 원본 날짜 기준 단일 발생만
                 if (baseMillis in monthStart until monthEnd) {
                     result.add(tx)
                 }
@@ -231,39 +222,36 @@ fun expandTransactionsForMonth(
         }
     }
 
-    // 화면용이니까 날짜(occurrenceDate 우선) 기준 내림차순 정렬
     return result.sortedByDescending {
         (it.occurrenceDate ?: it.date)?.toDate()?.time ?: 0L
     }
 }
 
-
-// 개별 가계부 내역(트랜잭션)을 표현하는 데이터 모델
+// Firestore의 단일 가계부 내역 구조
 data class TransactionItem(
-    val id: String,          // Firestore document ID
-    val amount: Long,        // 금액
-    val memo: String,        // 메모
-    val type: String,        // "income" 또는 "expense"
-    val category: String,    // 카테고리 이름
-    val date: Timestamp?,    // 시작일 (원본 기준)
+    val id: String,
+    val amount: Long,
+    val memo: String,
+    val type: String,              // "income" or "expense"
+    val category: String,
+    val date: Timestamp?,          // 원본 기준 날짜
     val isRecurring: Boolean = false,
-    val recurringInterval: String? = null,      // "weekly", "monthly", "yearly"
-    val recurringEndDate: Timestamp? = null,    // 반복 종료일(옵션)
-    val occurrenceDate: Timestamp? = null       // 실제 발생일(가상 내역용)
+    val recurringInterval: String? = null,   // "weekly", "monthly", "yearly"
+    val recurringEndDate: Timestamp? = null, // 반복 종료일
+    val occurrenceDate: Timestamp? = null    // 가상 내역용 실제 발생일
 )
 
 // 카테고리별 합계를 표현하는 데이터 모델
 data class CategoryTotal(
-    val category: String,    // 카테고리 이름
-    val total: Long          // 해당 카테고리의 합계 (수입 +, 지출 -)
+    val category: String,
+    val total: Long
 )
 
-// 앱 진입 지점. Compose를 사용해 전체 화면 구조와 네비게이션을 구성한다.
+// 앱 엔트리 포인트 Activity
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Firebase SDK 초기화 (앱 전체에서 한 번만 설정)
         FirebaseApp.initializeApp(this)
         Log.d(
             "FirebaseTest",
@@ -271,23 +259,17 @@ class MainActivity : ComponentActivity() {
         )
 
         setContent {
-            // 다크모드 여부를 저장하는 상태. rememberSaveable 덕분에 프로세스 내 재구성에도 유지된다.
             var isDarkMode by rememberSaveable { mutableStateOf(false) }
 
-            // 앱 전체 테마 적용
             GoalPocketTheme(darkTheme = isDarkMode) {
 
-                // 간단한 문자열 기반 화면 상태. 실제 앱에서는 NavHost로 대체 가능.
                 var screen by remember { mutableStateOf("login") }
-
-                // 수정 화면으로 전달할 선택된 트랜잭션
                 var selectedTransaction by remember { mutableStateOf<TransactionItem?>(null) }
 
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    // 화면 스위칭 로직
                     when (screen) {
                         "login" -> LoginScreen(
                             onSignUpClick = { screen = "signup" },
@@ -304,7 +286,7 @@ class MainActivity : ComponentActivity() {
                                 screen = "login"
                             },
                             onAddTransaction = { screen = "add" },
-                            onOpenCalendar = { screen = "calendar" }, // 현재는 bottom 탭으로 처리
+                            onOpenCalendar = { screen = "calendar" },
                             onOpenSettings = { screen = "settings" },
                             onSelectTransaction = { tx ->
                                 selectedTransaction = tx
@@ -346,7 +328,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 로그인 화면. Firebase Auth를 이용해 이메일/비밀번호 로그인 처리.
+// 이메일/비밀번호 기반 로그인 화면
 @Composable
 fun LoginScreen(
     onSignUpClick: () -> Unit = {},
@@ -373,7 +355,6 @@ fun LoginScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 이메일 입력
         OutlinedTextField(
             value = email,
             onValueChange = { email = it },
@@ -384,7 +365,6 @@ fun LoginScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 비밀번호 입력 (비가시 처리)
         OutlinedTextField(
             value = password,
             onValueChange = { password = it },
@@ -396,31 +376,33 @@ fun LoginScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 로그인 버튼
         Button(
             onClick = {
                 if (isLoading) return@Button
 
                 if (email.isBlank() || password.isBlank()) {
-                    Toast.makeText(context, "이메일과 비밀번호를 입력하세요.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        context,
+                        "이메일과 비밀번호를 입력해 주세요.",
+                        Toast.LENGTH_SHORT
+                    ).show()
                     return@Button
                 }
 
                 isLoading = true
 
-                // Firebase 이메일/비밀번호 로그인 요청
                 auth.signInWithEmailAndPassword(email, password)
                     .addOnCompleteListener { task ->
                         isLoading = false
                         if (task.isSuccessful) {
-                            Toast.makeText(context, "로그인 성공", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "로그인되었습니다.", Toast.LENGTH_SHORT).show()
                             Log.d("LoginAuth", "로그인 성공: ${auth.currentUser?.uid}")
                             onLoginSuccess()
                         } else {
                             Log.e("LoginAuth", "로그인 실패", task.exception)
                             Toast.makeText(
                                 context,
-                                "로그인 실패: ${task.exception?.localizedMessage ?: "알 수 없는 오류"}",
+                                "로그인에 실패했습니다: ${task.exception?.localizedMessage ?: "알 수 없는 오류입니다."}",
                                 Toast.LENGTH_SHORT
                             ).show()
                         }
@@ -434,14 +416,13 @@ fun LoginScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 회원가입 화면으로 이동
         TextButton(onClick = onSignUpClick) {
             Text("회원가입")
         }
     }
 }
 
-// 회원가입 화면. Firebase Auth를 통해 계정을 생성한다.
+// Firebase 이메일/비밀번호 회원가입 화면
 @Composable
 fun SignUpScreen(onBack: () -> Unit = {}) {
     val context = LocalContext.current
@@ -467,7 +448,6 @@ fun SignUpScreen(onBack: () -> Unit = {}) {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 이메일 입력
         OutlinedTextField(
             value = email,
             onValueChange = { email = it },
@@ -478,7 +458,6 @@ fun SignUpScreen(onBack: () -> Unit = {}) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 비밀번호 입력
         OutlinedTextField(
             value = password,
             onValueChange = { password = it },
@@ -490,7 +469,6 @@ fun SignUpScreen(onBack: () -> Unit = {}) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 비밀번호 확인 입력
         OutlinedTextField(
             value = confirmPassword,
             onValueChange = { confirmPassword = it },
@@ -502,14 +480,12 @@ fun SignUpScreen(onBack: () -> Unit = {}) {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 회원가입 처리 버튼
         Button(
             onClick = {
                 if (isLoading) return@Button
 
-                // 유효성 검증
                 if (email.isBlank() || password.isBlank() || confirmPassword.isBlank()) {
-                    Toast.makeText(context, "모든 값을 입력하세요.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "모든 값을 입력해 주세요.", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
 
@@ -525,19 +501,22 @@ fun SignUpScreen(onBack: () -> Unit = {}) {
 
                 isLoading = true
 
-                // Firebase 계정 생성 요청
                 auth.createUserWithEmailAndPassword(email, password)
                     .addOnCompleteListener { task ->
                         isLoading = false
                         if (task.isSuccessful) {
                             Log.d("SignUpAuth", "회원가입 성공: ${auth.currentUser?.uid}")
-                            Toast.makeText(context, "회원가입 성공", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(
+                                context,
+                                "회원가입이 완료되었습니다.",
+                                Toast.LENGTH_SHORT
+                            ).show()
                             onBack()
                         } else {
                             Log.e("SignUpAuth", "회원가입 실패", task.exception)
                             Toast.makeText(
                                 context,
-                                "회원가입 실패: ${task.exception?.localizedMessage ?: "알 수 없는 오류"}",
+                                "회원가입에 실패했습니다: ${task.exception?.localizedMessage ?: "알 수 없는 오류입니다."}",
                                 Toast.LENGTH_SHORT
                             ).show()
                         }
@@ -551,19 +530,19 @@ fun SignUpScreen(onBack: () -> Unit = {}) {
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 로그인 화면으로 복귀
         TextButton(onClick = onBack) {
-            Text("뒤로가기")
+            Text("뒤로 가기")
         }
     }
 }
 
+// 로그인 이후 메인 홈 화면 (하단 탭 + 월 이동)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     onLogout: () -> Unit = {},
     onAddTransaction: () -> Unit = {},
-    onOpenCalendar: () -> Unit = {},   // 현재는 사용하지 않지만 구조상 남겨둠
+    onOpenCalendar: () -> Unit = {},
     onOpenSettings: () -> Unit = {},
     onSelectTransaction: (TransactionItem) -> Unit = {}
 ) {
@@ -572,19 +551,24 @@ fun HomeScreen(
     val db = remember { FirebaseFirestore.getInstance() }
     val uid = auth.currentUser?.uid
 
-    // Firestore에서 가져온 전체 내역 목록
     var transactions by remember { mutableStateOf<List<TransactionItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(false) }
 
-    // 현재 연/월을 기준으로 시작
     val now = remember { Calendar.getInstance() }
     var selectedYear by remember { mutableStateOf(now.get(Calendar.YEAR)) }
     var selectedMonth by remember { mutableStateOf(now.get(Calendar.MONTH)) } // 0~11
 
-    // 하단 네비게이션 탭 인덱스 (0: 홈, 1: 카테고리, 2: 캘린더)
     var selectedTab by remember { mutableStateOf(0) }
 
-    // Firestore 실시간 구독. uid가 바뀌면 새로 구독하고, Composable이 dispose될 때 구독 해제.
+    // 상단 연·월을 눌러서 여는 캘린더 다이얼로그 상태
+    var showMonthPicker by remember { mutableStateOf(false) }
+    val monthPickerState = rememberDatePickerState(
+        initialSelectedDateMillis = Calendar.getInstance().apply {
+            set(selectedYear, selectedMonth, 1, 0, 0, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+    )
+
     DisposableEffect(uid) {
         if (uid == null) {
             transactions = emptyList()
@@ -604,14 +588,13 @@ fun HomeScreen(
                             Log.e("HomeScreen", "snapshot error", e)
                             Toast.makeText(
                                 context,
-                                "내역 불러오기 실패: ${e.localizedMessage}",
+                                "내역을 불러오지 못했습니다: ${e.localizedMessage}",
                                 Toast.LENGTH_SHORT
                             ).show()
                             return@addSnapshotListener
                         }
 
                         if (snapshot != null) {
-                            // 문서를 TransactionItem 리스트로 매핑
                             transactions = snapshot.documents.map { doc ->
                                 TransactionItem(
                                     id = doc.id,
@@ -629,14 +612,12 @@ fun HomeScreen(
                         }
                     }
 
-            // DisposableEffect가 종료될 때 리스너 해제
             onDispose {
                 registration.remove()
             }
         }
     }
 
-    // 현재 선택된 연/월에 대해 정기결제를 포함한 가상 내역 리스트 생성
     val filteredTransactions = remember(transactions, selectedYear, selectedMonth) {
         expandTransactionsForMonth(
             baseTransactions = transactions,
@@ -645,7 +626,6 @@ fun HomeScreen(
         )
     }
 
-    // 월별 수입, 지출, 순이익 계산
     val incomeTotal = filteredTransactions
         .filter { it.type == "income" }
         .sumOf { it.amount }
@@ -657,40 +637,21 @@ fun HomeScreen(
     val netTotal = incomeTotal - expenseTotal
     val monthLabel = "%04d-%02d".format(selectedYear, selectedMonth + 1)
 
-    // 카테고리별 합계 계산 (수입/지출 모두 포함, 수입 +, 지출 -)
-    val categoryTotals = remember(filteredTransactions) {
-        filteredTransactions
-            .groupBy { it.category.ifBlank { "기타" } }
-            .map { (cat, list) ->
-                val total = list.sumOf { tx ->
-                    if (tx.type == "income") tx.amount else -tx.amount
-                }
-                CategoryTotal(
-                    category = cat,
-                    total = total
-                )
-            }
-            .sortedByDescending { it.total }
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("GoalPocket") },
                 actions = {
-                    // 설정 화면 이동
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "설정")
                     }
-                    // 로그아웃
                     IconButton(onClick = onLogout) {
-                        Icon(Icons.Default.ExitToApp, contentDescription = "Logout")
+                        Icon(Icons.Default.ExitToApp, contentDescription = "로그아웃")
                     }
                 }
             )
         },
         bottomBar = {
-            // 하단 네비게이션 바: 홈 / 카테고리 / 캘린더
             NavigationBar {
                 NavigationBarItem(
                     selected = selectedTab == 0,
@@ -722,7 +683,7 @@ fun HomeScreen(
         ) {
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 상단의 월 이동 UI (◀ 2025-12 ▶)
+            // 상단 연·월 선택 영역 (좌우 화살표 + 가운데 텍스트 클릭 시 캘린더)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Center,
@@ -730,7 +691,6 @@ fun HomeScreen(
             ) {
                 TextButton(
                     onClick = {
-                        // 이전 달로 이동. 1월에서 이전이면 전년도 12월로.
                         if (selectedMonth == 0) {
                             selectedMonth = 11
                             selectedYear -= 1
@@ -743,12 +703,13 @@ fun HomeScreen(
                 Text(
                     text = monthLabel,
                     style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(horizontal = 16.dp)
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp)
+                        .clickable { showMonthPicker = true }
                 )
 
                 TextButton(
                     onClick = {
-                        // 다음 달로 이동. 12월에서 다음이면 다음 해 1월로.
                         if (selectedMonth == 11) {
                             selectedMonth = 0
                             selectedYear += 1
@@ -761,7 +722,6 @@ fun HomeScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 탭별 화면 전환
             when (selectedTab) {
                 0 -> HomeMainTab(
                     monthLabel = monthLabel,
@@ -773,7 +733,7 @@ fun HomeScreen(
                 )
 
                 1 -> HomeCategoryTab(
-                    categoryTotals = categoryTotals,
+                    monthTransactions = filteredTransactions,
                     isLoading = isLoading
                 )
 
@@ -782,14 +742,39 @@ fun HomeScreen(
                     month = selectedMonth,
                     monthLabel = monthLabel,
                     monthTransactions = filteredTransactions,
-                    onSelectTransaction = onSelectTransaction   // 날짜별 내역 클릭 시 수정으로 연결
+                    onSelectTransaction = onSelectTransaction
                 )
             }
         }
     }
+
+    // 상단 연·월 텍스트 클릭 시 띄우는 캘린더 다이얼로그
+    if (showMonthPicker) {
+        DatePickerDialog(
+            onDismissRequest = { showMonthPicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val millis = monthPickerState.selectedDateMillis
+                        if (millis != null) {
+                            val cal = Calendar.getInstance().apply { timeInMillis = millis }
+                            selectedYear = cal.get(Calendar.YEAR)
+                            selectedMonth = cal.get(Calendar.MONTH) // 0~11
+                        }
+                        showMonthPicker = false
+                    }
+                ) { Text("확인") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showMonthPicker = false }) { Text("취소") }
+            }
+        ) {
+            DatePicker(state = monthPickerState)
+        }
+    }
 }
 
-// 홈 탭 메인 내용. 요약 카드 + 내역 리스트를 보여준다.
+// 홈 탭: 월 합계와 상세 내역 리스트
 @Composable
 fun HomeMainTab(
     monthLabel: String,
@@ -808,12 +793,10 @@ fun HomeMainTab(
     ) {
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 월별 순이익 요약 카드
         SummaryCard(monthLabel = monthLabel, netTotal = netTotal)
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 내역 추가 버튼
         Button(
             onClick = onAddTransaction,
             modifier = Modifier.fillMaxWidth()
@@ -823,7 +806,6 @@ fun HomeMainTab(
 
         Spacer(modifier = Modifier.height(18.dp))
 
-        // 상세 내역 제목
         Text(
             text = "상세 내역",
             style = MaterialTheme.typography.titleMedium,
@@ -850,7 +832,6 @@ fun HomeMainTab(
                     modifier = Modifier.fillMaxSize()
                 ) {
                     items(filteredTransactions) { tx ->
-                        // 화면에 표시할 날짜는 occurrenceDate 우선, 없으면 원래 date
                         val displayDate = tx.occurrenceDate ?: tx.date
 
                         Column(
@@ -859,7 +840,6 @@ fun HomeMainTab(
                                 .clickable { onSelectTransaction(tx) }
                                 .padding(vertical = 8.dp)
                         ) {
-                            // 첫 줄: 메모 + 금액
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
@@ -887,7 +867,6 @@ fun HomeMainTab(
 
                             Spacer(modifier = Modifier.height(2.dp))
 
-                            // 두 번째 줄: 카테고리(+ 정기결제 뱃지) + 날짜
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -935,10 +914,10 @@ fun HomeMainTab(
     }
 }
 
-// 카테고리 탭. 카테고리별 합계(수입/지출 모두 반영)를 보여준다.
+// 카테고리 탭: 카테고리별 합계 및 정기결제 목록
 @Composable
 fun HomeCategoryTab(
-    categoryTotals: List<CategoryTotal>,
+    monthTransactions: List<TransactionItem>,
     isLoading: Boolean
 ) {
     Text(
@@ -953,60 +932,165 @@ fun HomeCategoryTab(
         return
     }
 
-    if (categoryTotals.isEmpty()) {
-        Text("이 달 내역이 없습니다.")
-        return
+    val categoryTotals = remember(monthTransactions) {
+        monthTransactions
+            .groupBy { it.category.ifBlank { "기타" } }
+            .map { (cat, list) ->
+                val total = list.sumOf { tx ->
+                    if (tx.type == "income") tx.amount else -tx.amount
+                }
+                CategoryTotal(
+                    category = cat,
+                    total = total
+                )
+            }
+            .sortedByDescending { it.total }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-    ) {
-        categoryTotals.forEach { ct ->
-            val amountText = formatNetAmount(ct.total)
-            val amountColor = when {
-                ct.total > 0 -> MaterialTheme.colorScheme.primary   // 순수입
-                ct.total < 0 -> MaterialTheme.colorScheme.error     // 순지출
-                else -> MaterialTheme.colorScheme.onSurface         // 0원
-            }
+    if (categoryTotals.isEmpty()) {
+        Text("이 달 내역이 없습니다.")
+    } else {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+        ) {
+            categoryTotals.forEachIndexed { index, ct ->
+                val amountText = formatNetAmount(ct.total)
+                val amountColor = when {
+                    ct.total > 0 -> MaterialTheme.colorScheme.primary
+                    ct.total < 0 -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurface
+                }
 
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = ct.category,
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Text(
-                    text = amountText,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = amountColor
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = ct.category,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        text = amountText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = amountColor
+                    )
+                }
+
+                if (index < categoryTotals.size - 1) {
+                    Divider()
+                }
             }
-            Divider()
+        }
+    }
+
+    val recurringTransactions = remember(monthTransactions) {
+        monthTransactions.filter { it.isRecurring }
+    }
+
+    if (recurringTransactions.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(32.dp))
+
+        Text(
+            text = "정기결제 목록",
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+        ) {
+            recurringTransactions.forEachIndexed { index, tx ->
+
+                val effectiveType =
+                    if (tx.type.isBlank()) "expense" else tx.type
+                val amountText = formatSignedAmount(tx.amount, effectiveType)
+                val amountColor =
+                    if (effectiveType == "income") MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error
+
+                val displayDate = tx.occurrenceDate ?: tx.date
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = tx.memo.ifBlank { "메모 없음" },
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                        Text(
+                            text = amountText,
+                            color = amountColor
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(2.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = tx.category,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
+                            Spacer(modifier = Modifier.width(4.dp))
+
+                            Box(
+                                modifier = Modifier
+                                    .border(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.primary,
+                                        RoundedCornerShape(4.dp)
+                                    )
+                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                            ) {
+                                Text(
+                                    text = "정기결제",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = formatDate(displayDate),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                if (index < recurringTransactions.size - 1) {
+                    Divider()
+                }
+            }
         }
     }
 }
 
-// 캘린더 탭. 일별 순이익을 간단한 캘린더 형태로 보여주고,
-// 날짜를 선택하면 해당 날짜의 내역 리스트를 제공한다.
-// 캘린더 탭. 일별 순이익을 간단한 캘린더 형태로 보여주고,
-// 날짜를 선택하면 해당 날짜의 내역 리스트를 제공한다.
-// 캘린더 탭. 일별 순이익을 간단한 캘린더 형태로 보여주고,
-// 날짜를 선택하면 해당 날짜의 내역 리스트를 제공한다.
+// 캘린더 탭: 날짜별 합계와 일자별 상세 내역
 @Composable
 fun HomeCalendarTab(
     year: Int,
-    month: Int, // 0~11
+    month: Int,
     monthLabel: String,
     monthTransactions: List<TransactionItem>,
     onSelectTransaction: (TransactionItem) -> Unit
 ) {
-    // 날짜별 합계 맵 생성. key: 일(dayOfMonth), value: 순이익(수입 - 지출)
-    // 정기결제 가상 내역은 occurrenceDate를 우선 사용.
     val dailyTotals: Map<Int, Long> = remember(monthTransactions) {
         monthTransactions
             .groupBy { tx ->
@@ -1023,7 +1107,6 @@ fun HomeCalendarTab(
 
     var selectedDay by remember { mutableStateOf<Int?>(null) }
 
-    // 선택된 일자에 해당하는 내역만 필터링 (역시 occurrenceDate 우선)
     val selectedDayTransactions = remember(monthTransactions, selectedDay) {
         if (selectedDay == null) emptyList()
         else monthTransactions.filter { tx ->
@@ -1042,7 +1125,6 @@ fun HomeCalendarTab(
     Divider()
     Spacer(modifier = Modifier.height(12.dp))
 
-    // 요일 헤더 표시
     val weekDays = listOf("일", "월", "화", "수", "목", "금", "토")
 
     Row(
@@ -1063,7 +1145,6 @@ fun HomeCalendarTab(
     Divider()
     Spacer(modifier = Modifier.height(6.dp))
 
-    // 해당 연/월의 1일 기준으로 달력 구조 계산
     val cal = Calendar.getInstance().apply {
         set(year, month, 1)
     }
@@ -1136,7 +1217,7 @@ fun HomeCalendarTab(
 
     Text(
         text = if (selectedDay == null)
-            "날짜를 선택하세요."
+            "날짜를 선택해 주세요."
         else
             "${monthLabel}-${"%02d".format(selectedDay)} 내역",
         style = MaterialTheme.typography.titleMedium
@@ -1152,15 +1233,17 @@ fun HomeCalendarTab(
         selectedDayTransactions.isNotEmpty() -> {
             LazyColumn {
                 items(selectedDayTransactions) { tx ->
-                    val amountText = formatSignedAmount(tx.amount, tx.type)
+                    val effectiveType =
+                        if (tx.type.isBlank()) "expense" else tx.type
+                    val amountText = formatSignedAmount(tx.amount, effectiveType)
                     val amountColor =
-                        if (tx.type == "income") MaterialTheme.colorScheme.primary
+                        if (effectiveType == "income") MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.error
 
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onSelectTransaction(tx) }   // 메인 내역 수정으로 이동
+                            .clickable { onSelectTransaction(tx) }
                             .padding(vertical = 6.dp)
                     ) {
                         Row(
@@ -1178,7 +1261,6 @@ fun HomeCalendarTab(
                         }
                         Spacer(modifier = Modifier.height(2.dp))
 
-                        // 카테고리 + 정기결제 뱃지
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.Start,
@@ -1216,9 +1298,7 @@ fun HomeCalendarTab(
     }
 }
 
-
-
-// 수입/지출 타입을 선택하는 토글 버튼. 지출/수입 두 버튼에서 재사용된다.
+// 지출/수입, 일반/정기결제 등에 공통으로 사용하는 토글 버튼
 @Composable
 fun TypeToggleButton(
     text: String,
@@ -1247,6 +1327,7 @@ fun TypeToggleButton(
     }
 }
 
+// 내역 추가 화면
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddTransactionScreen(
@@ -1276,10 +1357,9 @@ fun AddTransactionScreen(
         selectedDateMillis?.let { sdf.format(Date(it)) } ?: "날짜 선택"
     }
 
-    // 정기결제 관련 상태
-    var isRecurring by remember { mutableStateOf(false) }                 // 일반/정기결제 토글
-    var recurringInterval by remember { mutableStateOf("monthly") }      // "weekly", "monthly", "yearly"
-    var hasEndDate by remember { mutableStateOf(false) }                 // 마감일 사용 여부
+    var isRecurring by remember { mutableStateOf(false) }
+    var recurringInterval by remember { mutableStateOf("monthly") }
+    var hasEndDate by remember { mutableStateOf(false) }
     var endDateMillis by remember { mutableStateOf<Long?>(null) }
 
     val formattedEndDate = remember(hasEndDate, endDateMillis) {
@@ -1300,7 +1380,6 @@ fun AddTransactionScreen(
         initialSelectedDateMillis = selectedDateMillis ?: System.currentTimeMillis()
     )
 
-    // 정기결제 마감일용 DatePicker
     var showEndDatePicker by remember { mutableStateOf(false) }
     val endDatePickerState = rememberDatePickerState(
         initialSelectedDateMillis = endDateMillis ?: System.currentTimeMillis()
@@ -1356,7 +1435,6 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 지출/수입 타입 토글
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1398,7 +1476,6 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 카테고리 선택
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1420,7 +1497,6 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 거래 날짜 선택
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1442,7 +1518,6 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // 일반 / 정기결제 토글
         Text(
             text = "결제 유형",
             style = MaterialTheme.typography.bodyMedium,
@@ -1476,7 +1551,6 @@ fun AddTransactionScreen(
         if (isRecurring) {
             Spacer(modifier = Modifier.height(16.dp))
 
-            // 주기 선택 (주 / 월 / 년)
             Text(
                 text = "반복 주기",
                 style = MaterialTheme.typography.bodyMedium,
@@ -1510,7 +1584,6 @@ fun AddTransactionScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // 마감일 설정
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1521,7 +1594,7 @@ fun AddTransactionScreen(
                 Column {
                     Text("마감일")
                     Text(
-                        text = "기본은 '없음'이고, 설정한 경우에만 적용돼.",
+                        text = "기본값은 '없음'이며, 설정한 경우에만 적용됩니다.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -1566,18 +1639,18 @@ fun AddTransactionScreen(
         Button(
             onClick = {
                 if (uid == null) {
-                    Toast.makeText(context, "로그인 정보 없음", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "로그인 정보가 없습니다.", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
 
                 if (amountText.isBlank()) {
-                    Toast.makeText(context, "금액 입력하세요.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "금액을 입력해 주세요.", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
 
                 val amount = amountText.toLongOrNull() ?: 0
                 if (amount <= 0) {
-                    Toast.makeText(context, "금액이 올바르지 않습니다.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "유효한 금액이 아닙니다.", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
 
@@ -1604,11 +1677,11 @@ fun AddTransactionScreen(
                     .collection("transactions")
                     .add(data)
                     .addOnSuccessListener {
-                        Toast.makeText(context, "저장 완료", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "저장되었습니다.", Toast.LENGTH_SHORT).show()
                         onSaved()
                     }
                     .addOnFailureListener {
-                        Toast.makeText(context, "저장 실패", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "저장에 실패했습니다.", Toast.LENGTH_SHORT).show()
                     }
             },
             modifier = Modifier.fillMaxWidth()
@@ -1652,7 +1725,6 @@ fun AddTransactionScreen(
         }
     }
 
-    // 거래 날짜 선택
     if (showDatePicker) {
         DatePickerDialog(
             onDismissRequest = { showDatePicker = false },
@@ -1674,7 +1746,6 @@ fun AddTransactionScreen(
         }
     }
 
-    // 정기결제 마감일 선택
     if (showEndDatePicker) {
         DatePickerDialog(
             onDismissRequest = { showEndDatePicker = false },
@@ -1698,10 +1769,10 @@ fun AddTransactionScreen(
     }
 }
 
-// 월 합계(순이익)를 보여주는 카드. 홈 탭 상단에서 사용된다.
+// 홈 탭 상단에 노출되는 월 합계 카드
 @Composable
 fun SummaryCard(monthLabel: String, netTotal: Long) {
-    val monthNumber = monthLabel.substring(5, 7).toInt()  // ex) "2025-12" → 12
+    val monthNumber = monthLabel.substring(5, 7).toInt()
 
     Surface(
         modifier = Modifier
@@ -1730,6 +1801,7 @@ fun SummaryCard(monthLabel: String, netTotal: Long) {
     }
 }
 
+// 기존 내역 수정/삭제 화면
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun EditTransactionScreen(
@@ -1751,9 +1823,9 @@ fun EditTransactionScreen(
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text("수정할 내역을 찾을 수 없어.")
+            Text("수정할 내역을 찾을 수 없습니다.")
             Spacer(modifier = Modifier.height(8.dp))
-            Button(onClick = onCancel) { Text("뒤로가기") }
+            Button(onClick = onCancel) { Text("뒤로 가기") }
         }
         return
     }
@@ -1778,7 +1850,6 @@ fun EditTransactionScreen(
         selectedDateMillis?.let { sdf.format(Date(it)) } ?: "날짜 선택"
     }
 
-    // 정기결제 관련 상태 (추가 화면과 동일한 구조)
     var isRecurring by remember { mutableStateOf(transaction.isRecurring) }
     var recurringInterval by remember {
         mutableStateOf(transaction.recurringInterval ?: "monthly")
@@ -1869,7 +1940,8 @@ fun EditTransactionScreen(
                                 .document(transaction.id)
                                 .delete()
                                 .addOnSuccessListener {
-                                    Toast.makeText(context, "삭제 완료", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "삭제되었습니다.", Toast.LENGTH_SHORT)
+                                        .show()
                                     onDeleted()
                                 }
                         }
@@ -1888,7 +1960,6 @@ fun EditTransactionScreen(
             verticalArrangement = Arrangement.Top,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // 지출/수입 타입 토글
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1929,7 +2000,6 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 카테고리 수정
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1951,7 +2021,6 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 날짜 수정
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1973,7 +2042,6 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 결제 유형 (일반 / 정기결제)
             Text(
                 text = "결제 유형",
                 style = MaterialTheme.typography.bodyMedium,
@@ -2050,7 +2118,7 @@ fun EditTransactionScreen(
                     Column {
                         Text("마감일")
                         Text(
-                            text = "기본은 '없음'이고, 설정한 경우에만 적용돼.",
+                            text = "기본값은 '없음'이며, 설정한 경우에만 적용됩니다.",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -2096,7 +2164,7 @@ fun EditTransactionScreen(
                 onClick = {
                     val amount = amountText.toLongOrNull() ?: 0
                     if (amount <= 0) {
-                        Toast.makeText(context, "금액이 올바르지 않아", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "유효한 금액이 아닙니다.", Toast.LENGTH_SHORT).show()
                         return@Button
                     }
 
@@ -2124,7 +2192,7 @@ fun EditTransactionScreen(
                         .document(transaction.id)
                         .update(data)
                         .addOnSuccessListener {
-                            Toast.makeText(context, "수정 완료", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "수정되었습니다.", Toast.LENGTH_SHORT).show()
                             onSaved()
                         }
                 },
@@ -2208,7 +2276,7 @@ fun EditTransactionScreen(
     }
 }
 
-
+// 설정 화면: 다크 모드, 카테고리 관리, 앱 정보
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
@@ -2220,7 +2288,6 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
 
-    // 설정 화면: 다크 모드 토글, 카테고리 관리, 앱 정보 진입 등을 제공
     Scaffold(
         topBar = {
             TopAppBar(
@@ -2241,7 +2308,6 @@ fun SettingsScreen(
             verticalArrangement = Arrangement.Top,
             horizontalAlignment = Alignment.Start
         ) {
-            // 다크 모드 스위치
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2262,7 +2328,7 @@ fun SettingsScreen(
                         onDarkModeChange(checked)
                         Toast.makeText(
                             context,
-                            if (checked) "다크 모드로 전환" else "라이트 모드로 전환",
+                            if (checked) "다크 모드로 전환되었습니다." else "라이트 모드로 전환되었습니다.",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -2271,7 +2337,6 @@ fun SettingsScreen(
 
             Divider(modifier = Modifier.padding(vertical = 16.dp))
 
-            // 카테고리 관리 화면으로 이동
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2286,7 +2351,7 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "카테고리를 추가·삭제",
+                        text = "카테고리를 추가 또는 삭제합니다.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -2298,7 +2363,6 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 앱 정보 화면으로 이동
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2326,6 +2390,7 @@ fun SettingsScreen(
     }
 }
 
+// 카테고리 관리 화면
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CategorySettingsScreen(
@@ -2336,12 +2401,10 @@ fun CategorySettingsScreen(
     val db = remember { FirebaseFirestore.getInstance() }
     val uid = auth.currentUser?.uid
 
-    // 카테고리 목록과 입력 상태
     var categories by remember { mutableStateOf(defaultCategories()) }
     var newCategory by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
 
-    // 로그인된 사용자 기준으로 카테고리 설정 문서를 로드
     LaunchedEffect(uid) {
         if (uid == null) return@LaunchedEffect
         isLoading = true
@@ -2365,7 +2428,6 @@ fun CategorySettingsScreen(
                     defaultCategories()
                 }
 
-                // 문서가 없거나 비어있으면 기본 카테고리로 초기화해서 저장
                 if (!doc.exists() || items.isNullOrEmpty()) {
                     docRef.set(mapOf("items" to categories))
                 }
@@ -2379,7 +2441,7 @@ fun CategorySettingsScreen(
             }
     }
 
-    // Firestore에 카테고리 리스트 전체를 저장하는 헬퍼
+    // 카테고리 리스트 전체를 Firestore에 저장하는 헬퍼 함수
     fun saveCategories(updated: List<String>) {
         if (uid == null) return
         db.collection("users")
@@ -2391,7 +2453,7 @@ fun CategorySettingsScreen(
                 Log.e("CategorySettingsScreen", "save categories error", e)
                 Toast.makeText(
                     context,
-                    "카테고리 저장 실패: ${e.localizedMessage}",
+                    "카테고리를 저장하지 못했습니다: ${e.localizedMessage}",
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -2418,8 +2480,7 @@ fun CategorySettingsScreen(
             horizontalAlignment = Alignment.Start
         ) {
             if (uid == null) {
-                // 비로그인 상태에서 접근 시 안내 문구
-                Text("로그인 상태에서만 카테고리를 관리할 수 있어.")
+                Text("로그인 상태에서만 카테고리를 관리할 수 있습니다.")
                 return@Column
             }
 
@@ -2430,7 +2491,6 @@ fun CategorySettingsScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 상단의 카테고리 추가 영역
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2448,22 +2508,31 @@ fun CategorySettingsScreen(
                     onClick = {
                         val trimmed = newCategory.trim()
                         if (trimmed.isBlank()) {
-                            Toast.makeText(context, "카테고리 이름을 입력해줘", Toast.LENGTH_SHORT)
-                                .show()
+                            Toast.makeText(
+                                context,
+                                "카테고리 이름을 입력해 주세요.",
+                                Toast.LENGTH_SHORT
+                            ).show()
                             return@Button
                         }
                         if (categories.any { it == trimmed }) {
-                            Toast.makeText(context, "이미 존재하는 카테고리야", Toast.LENGTH_SHORT)
-                                .show()
+                            Toast.makeText(
+                                context,
+                                "이미 존재하는 카테고리입니다.",
+                                Toast.LENGTH_SHORT
+                            ).show()
                             return@Button
                         }
 
-                        // 새 카테고리를 리스트에 추가하고 Firestore에 저장
                         val updated = categories + trimmed
                         categories = updated
                         newCategory = ""
                         saveCategories(updated)
-                        Toast.makeText(context, "카테고리가 추가되었어", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            context,
+                            "카테고리가 추가되었습니다.",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                 ) {
                     Text("추가")
@@ -2482,10 +2551,8 @@ fun CategorySettingsScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             if (isLoading) {
-                // 카테고리 로딩 중
                 CircularProgressIndicator()
             } else {
-                // 카테고리 리스트 및 삭제 버튼
                 LazyColumn {
                     items(categories) { cat ->
                         Row(
@@ -2504,7 +2571,7 @@ fun CategorySettingsScreen(
                                     saveCategories(updated)
                                     Toast.makeText(
                                         context,
-                                        "카테고리가 삭제되었어",
+                                        "카테고리가 삭제되었습니다.",
                                         Toast.LENGTH_SHORT
                                     ).show()
                                 }
@@ -2523,16 +2590,15 @@ fun CategorySettingsScreen(
     }
 }
 
+// 앱 정보 화면
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    // 버전 정보는 직접 관리 (실제 앱에서는 BuildConfig에서 가져올 수 있음)
-    val versionName = "1.2.1"
-    val versionCode = 7
+    val versionName = "1.3.1"
+    val versionCode = 8
 
-    // 앱 정보 화면. 버전, 개발자 정보, 변경사항 등을 안내한다.
     Scaffold(
         topBar = {
             TopAppBar(
@@ -2553,7 +2619,6 @@ fun AboutAppScreen(
             verticalArrangement = Arrangement.Top,
             horizontalAlignment = Alignment.Start
         ) {
-            // 1. 앱 버전 정보
             Text(
                 text = "앱 버전",
                 style = MaterialTheme.typography.titleMedium
@@ -2568,7 +2633,6 @@ fun AboutAppScreen(
             Divider()
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 2. 개발자 정보
             Text(
                 text = "개발자",
                 style = MaterialTheme.typography.titleMedium
@@ -2587,15 +2651,15 @@ fun AboutAppScreen(
             Divider()
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 3. 최신 버전 변경사항
             Text(
                 text = "변경사항 (v$versionName)",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "• 이제 캘린터 탭에서도 내역을 수정하고 삭제할 수 있습니다.\n" +
-                        "• 카테고리 탭과 캘린터 탭의 금액 색상 표기가 수정되었습니다.",
+                text = "• 정기결제 기능이 추가되었습니다.\n" +
+                        "• 이제 화면 상단 날짜 선택을 캘린더를 통해 더 쉽게 할 수 있습니다.\n" +
+                        "• 이제 카테고리 탭에서 정기결제 목록을 확인할 수 있습니다.",
                 style = MaterialTheme.typography.bodyMedium
             )
         }
