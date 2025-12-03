@@ -51,6 +51,7 @@ import kotlinx.coroutines.launch
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
+import androidx.compose.foundation.border
 
 // 날짜를 "yyyy-MM-dd" 문자열로 포맷팅하는 유틸 함수
 fun formatDate(ts: Timestamp?): String {
@@ -82,6 +83,161 @@ fun formatNetAmount(net: Long): String {
 fun defaultCategories(): List<String> =
     listOf("식비", "카페", "교통", "쇼핑", "기타")
 
+// 주어진 원본 트랜잭션 리스트를 바탕으로,
+// 특정 연/월에 표시할 내역(정기 결제의 가상 내역 포함)을 만들어준다.
+fun expandTransactionsForMonth(
+    baseTransactions: List<TransactionItem>,
+    year: Int,
+    month: Int // 0~11
+): List<TransactionItem> {
+    val result = mutableListOf<TransactionItem>()
+
+    val monthStartCal = Calendar.getInstance().apply {
+        set(year, month, 1, 0, 0, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+    val monthStart = monthStartCal.timeInMillis
+
+    val monthEndCal = (monthStartCal.clone() as Calendar).apply {
+        add(Calendar.MONTH, 1)
+    }
+    val monthEnd = monthEndCal.timeInMillis // [monthStart, monthEnd) 범위
+
+    for (tx in baseTransactions) {
+        val baseDate = tx.date?.toDate() ?: continue
+        val baseMillis = baseDate.time
+        val endMillis = tx.recurringEndDate?.toDate()?.time
+
+        // 일반 내역은 해당 달에 들어가면 그대로 추가
+        if (!tx.isRecurring) {
+            if (baseMillis in monthStart until monthEnd) {
+                result.add(tx)
+            }
+            continue
+        }
+
+        when (tx.recurringInterval) {
+            "monthly" -> {
+                val baseCal = Calendar.getInstance().apply { time = baseDate }
+                val baseYear = baseCal.get(Calendar.YEAR)
+                val baseMonth = baseCal.get(Calendar.MONTH)
+
+                // 시작 이전 달이면 스킵
+                if (year < baseYear || (year == baseYear && month < baseMonth)) {
+                    continue
+                }
+
+                val occCal = Calendar.getInstance().apply {
+                    set(
+                        year,
+                        month,
+                        1,
+                        baseCal.get(Calendar.HOUR_OF_DAY),
+                        baseCal.get(Calendar.MINUTE),
+                        baseCal.get(Calendar.SECOND)
+                    )
+                    set(Calendar.MILLISECOND, baseCal.get(Calendar.MILLISECOND))
+
+                    val day = baseCal.get(Calendar.DAY_OF_MONTH)
+                    val maxDay = getActualMaximum(Calendar.DAY_OF_MONTH)
+                    set(Calendar.DAY_OF_MONTH, minOf(day, maxDay))
+                }
+
+                val occMillis = occCal.timeInMillis
+                if (occMillis < baseMillis) continue
+                if (endMillis != null && occMillis > endMillis) continue
+                if (occMillis !in monthStart until monthEnd) continue
+
+                result.add(
+                    tx.copy(
+                        occurrenceDate = Timestamp(Date(occMillis))
+                    )
+                )
+            }
+
+            "yearly" -> {
+                val baseCal = Calendar.getInstance().apply { time = baseDate }
+                val baseYear = baseCal.get(Calendar.YEAR)
+                val baseMonth = baseCal.get(Calendar.MONTH)
+
+                // 연/월이 맞지 않으면 스킵
+                if (month != baseMonth || year < baseYear) continue
+
+                val occCal = Calendar.getInstance().apply {
+                    set(
+                        year,
+                        month,
+                        baseCal.get(Calendar.DAY_OF_MONTH),
+                        baseCal.get(Calendar.HOUR_OF_DAY),
+                        baseCal.get(Calendar.MINUTE),
+                        baseCal.get(Calendar.SECOND)
+                    )
+                    set(Calendar.MILLISECOND, baseCal.get(Calendar.MILLISECOND))
+
+                    val maxDay = getActualMaximum(Calendar.DAY_OF_MONTH)
+                    if (get(Calendar.DAY_OF_MONTH) > maxDay) {
+                        set(Calendar.DAY_OF_MONTH, maxDay)
+                    }
+                }
+
+                val occMillis = occCal.timeInMillis
+                if (occMillis < baseMillis) continue
+                if (endMillis != null && occMillis > endMillis) continue
+                if (occMillis !in monthStart until monthEnd) continue
+
+                result.add(
+                    tx.copy(
+                        occurrenceDate = Timestamp(Date(occMillis))
+                    )
+                )
+            }
+
+            "weekly" -> {
+                val baseCal = Calendar.getInstance().apply { time = baseDate }
+
+                val occCal = Calendar.getInstance().apply {
+                    timeInMillis = maxOf(baseMillis, monthStart)
+                }
+
+                // 먼저 같은 요일에 맞춰 이동
+                while (occCal.timeInMillis < monthEnd &&
+                    occCal.get(Calendar.DAY_OF_WEEK) != baseCal.get(Calendar.DAY_OF_WEEK)
+                ) {
+                    occCal.add(Calendar.DAY_OF_MONTH, 1)
+                }
+
+                // 해당 달 범위 내에서 7일씩 증가시키면서 발생
+                while (occCal.timeInMillis in monthStart until monthEnd) {
+                    val occMillis = occCal.timeInMillis
+                    if (occMillis >= baseMillis &&
+                        (endMillis == null || occMillis <= endMillis)
+                    ) {
+                        result.add(
+                            tx.copy(
+                                occurrenceDate = Timestamp(Date(occMillis))
+                            )
+                        )
+                    }
+                    occCal.add(Calendar.DAY_OF_MONTH, 7)
+                }
+            }
+
+            else -> {
+                // 정의되지 않은 interval은 그냥 원본 날짜 기준 단일 발생만
+                if (baseMillis in monthStart until monthEnd) {
+                    result.add(tx)
+                }
+            }
+        }
+    }
+
+    // 화면용이니까 날짜(occurrenceDate 우선) 기준 내림차순 정렬
+    return result.sortedByDescending {
+        (it.occurrenceDate ?: it.date)?.toDate()?.time ?: 0L
+    }
+}
+
+
 // 개별 가계부 내역(트랜잭션)을 표현하는 데이터 모델
 data class TransactionItem(
     val id: String,          // Firestore document ID
@@ -89,7 +245,11 @@ data class TransactionItem(
     val memo: String,        // 메모
     val type: String,        // "income" 또는 "expense"
     val category: String,    // 카테고리 이름
-    val date: Timestamp?     // 거래일
+    val date: Timestamp?,    // 시작일 (원본 기준)
+    val isRecurring: Boolean = false,
+    val recurringInterval: String? = null,      // "weekly", "monthly", "yearly"
+    val recurringEndDate: Timestamp? = null,    // 반복 종료일(옵션)
+    val occurrenceDate: Timestamp? = null       // 실제 발생일(가상 내역용)
 )
 
 // 카테고리별 합계를 표현하는 데이터 모델
@@ -459,7 +619,10 @@ fun HomeScreen(
                                     memo = doc.getString("memo") ?: "",
                                     type = doc.getString("type") ?: "",
                                     category = doc.getString("category") ?: "",
-                                    date = doc.getTimestamp("date")
+                                    date = doc.getTimestamp("date"),
+                                    isRecurring = doc.getBoolean("isRecurring") ?: false,
+                                    recurringInterval = doc.getString("recurringInterval"),
+                                    recurringEndDate = doc.getTimestamp("recurringEndDate")
                                 )
                             }
                             isLoading = false
@@ -473,14 +636,13 @@ fun HomeScreen(
         }
     }
 
-    // 현재 선택된 연/월에 해당하는 내역만 필터링
+    // 현재 선택된 연/월에 대해 정기결제를 포함한 가상 내역 리스트 생성
     val filteredTransactions = remember(transactions, selectedYear, selectedMonth) {
-        transactions.filter { tx ->
-            val ts = tx.date ?: return@filter false
-            val cal = Calendar.getInstance().apply { time = ts.toDate() }
-            cal.get(Calendar.YEAR) == selectedYear &&
-                    cal.get(Calendar.MONTH) == selectedMonth
-        }
+        expandTransactionsForMonth(
+            baseTransactions = transactions,
+            year = selectedYear,
+            month = selectedMonth
+        )
     }
 
     // 월별 수입, 지출, 순이익 계산
@@ -671,7 +833,6 @@ fun HomeMainTab(
 
         when {
             isLoading -> {
-                // Firestore 로딩 중
                 Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
@@ -681,20 +842,21 @@ fun HomeMainTab(
             }
 
             filteredTransactions.isEmpty() -> {
-                // 선택한 달에 내역이 없는 경우
                 Text("이 달 등록된 내역이 없습니다.")
             }
 
             else -> {
-                // 내역 리스트 출력
                 LazyColumn(
                     modifier = Modifier.fillMaxSize()
                 ) {
                     items(filteredTransactions) { tx ->
+                        // 화면에 표시할 날짜는 occurrenceDate 우선, 없으면 원래 date
+                        val displayDate = tx.occurrenceDate ?: tx.date
+
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onSelectTransaction(tx) } // 클릭 시 수정 화면으로
+                                .clickable { onSelectTransaction(tx) }
                                 .padding(vertical = 8.dp)
                         ) {
                             // 첫 줄: 메모 + 금액
@@ -712,7 +874,6 @@ fun HomeMainTab(
                                     if (tx.type == "income") "+${formattedAmount}원"
                                     else "-${formattedAmount}원"
 
-                                // 수입은 파란색, 지출은 빨간색 계열
                                 val color = if (tx.type == "income")
                                     MaterialTheme.colorScheme.primary
                                 else
@@ -726,17 +887,42 @@ fun HomeMainTab(
 
                             Spacer(modifier = Modifier.height(2.dp))
 
-                            // 두 번째 줄: 카테고리 + 날짜
+                            // 두 번째 줄: 카테고리(+ 정기결제 뱃지) + 날짜
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = tx.category,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+
+                                    if (tx.isRecurring) {
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .border(
+                                                    1.dp,
+                                                    MaterialTheme.colorScheme.primary,
+                                                    RoundedCornerShape(4.dp)
+                                                )
+                                                .padding(horizontal = 4.dp, vertical = 1.dp)
+                                        ) {
+                                            Text(
+                                                text = "정기결제",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                    }
+                                }
+
                                 Text(
-                                    text = tx.category,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                                Text(
-                                    text = formatDate(tx.date),
+                                    text = formatDate(displayDate),
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -807,6 +993,10 @@ fun HomeCategoryTab(
 
 // 캘린더 탭. 일별 순이익을 간단한 캘린더 형태로 보여주고,
 // 날짜를 선택하면 해당 날짜의 내역 리스트를 제공한다.
+// 캘린더 탭. 일별 순이익을 간단한 캘린더 형태로 보여주고,
+// 날짜를 선택하면 해당 날짜의 내역 리스트를 제공한다.
+// 캘린더 탭. 일별 순이익을 간단한 캘린더 형태로 보여주고,
+// 날짜를 선택하면 해당 날짜의 내역 리스트를 제공한다.
 @Composable
 fun HomeCalendarTab(
     year: Int,
@@ -816,29 +1006,31 @@ fun HomeCalendarTab(
     onSelectTransaction: (TransactionItem) -> Unit
 ) {
     // 날짜별 합계 맵 생성. key: 일(dayOfMonth), value: 순이익(수입 - 지출)
+    // 정기결제 가상 내역은 occurrenceDate를 우선 사용.
     val dailyTotals: Map<Int, Long> = remember(monthTransactions) {
-        monthTransactions.groupBy { tx ->
-            val ts = tx.date ?: return@groupBy 0
-            val cal = Calendar.getInstance().apply { time = ts.toDate() }
-            cal.get(Calendar.DAY_OF_MONTH)
-        }.mapValues { (_, list) ->
-            list.sumOf { tx ->
-                if (tx.type == "income") tx.amount else -tx.amount
+        monthTransactions
+            .groupBy { tx ->
+                val ts = (tx.occurrenceDate ?: tx.date) ?: return@groupBy 0
+                val cal = Calendar.getInstance().apply { time = ts.toDate() }
+                cal.get(Calendar.DAY_OF_MONTH)
             }
-        }
+            .mapValues { (_, list) ->
+                list.sumOf { tx ->
+                    if (tx.type == "income") tx.amount else -tx.amount
+                }
+            }
     }
 
-    // 선택된 일자 상태
     var selectedDay by remember { mutableStateOf<Int?>(null) }
 
-    // 선택된 일자에 해당하는 내역만 필터링
+    // 선택된 일자에 해당하는 내역만 필터링 (역시 occurrenceDate 우선)
     val selectedDayTransactions = remember(monthTransactions, selectedDay) {
-        if (selectedDay == null) emptyList() else
-            monthTransactions.filter { tx ->
-                val ts = tx.date ?: return@filter false
-                val cal = Calendar.getInstance().apply { time = ts.toDate() }
-                cal.get(Calendar.DAY_OF_MONTH) == selectedDay
-            }
+        if (selectedDay == null) emptyList()
+        else monthTransactions.filter { tx ->
+            val ts = (tx.occurrenceDate ?: tx.date) ?: return@filter false
+            val cal = Calendar.getInstance().apply { time = ts.toDate() }
+            cal.get(Calendar.DAY_OF_MONTH) == selectedDay
+        }
     }
 
     Text(
@@ -875,14 +1067,12 @@ fun HomeCalendarTab(
     val cal = Calendar.getInstance().apply {
         set(year, month, 1)
     }
-    val firstDayOfWeek = cal.get(Calendar.DAY_OF_WEEK)      // 1일이 무슨 요일인지
-    val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH) // 이 달의 일 수
+    val firstDayOfWeek = cal.get(Calendar.DAY_OF_WEEK)
+    val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
 
-    // 전체 셀 개수와 행(row) 수 계산
     val totalCells = firstDayOfWeek - 1 + daysInMonth
     val rows = (totalCells + 6) / 7
 
-    // 달력 그리드
     Column {
         var day = 1
         for (r in 0 until rows) {
@@ -895,7 +1085,6 @@ fun HomeCalendarTab(
                 for (c in 0 until 7) {
                     val cellIndex = r * 7 + c
                     if (cellIndex < firstDayOfWeek - 1 || day > daysInMonth) {
-                        // 앞/뒤 여백 셀
                         Box(
                             modifier = Modifier
                                 .weight(1f)
@@ -916,7 +1105,6 @@ fun HomeCalendarTab(
                                 .weight(1f)
                                 .height(40.dp)
                                 .clickable {
-                                    // 셀 클릭 시 해당 날짜 선택
                                     selectedDay = today
                                 }
                                 .padding(2.dp),
@@ -946,7 +1134,6 @@ fun HomeCalendarTab(
     Divider()
     Spacer(modifier = Modifier.height(24.dp))
 
-    // 선택 날짜 제목
     Text(
         text = if (selectedDay == null)
             "날짜를 선택하세요."
@@ -959,12 +1146,10 @@ fun HomeCalendarTab(
 
     when {
         selectedDay != null && selectedDayTransactions.isEmpty() -> {
-            // 선택한 날짜에 내역이 없을 때
             Text("이 날짜에는 등록된 내역이 없습니다.")
         }
 
         selectedDayTransactions.isNotEmpty() -> {
-            // 선택한 날짜의 내역 리스트
             LazyColumn {
                 items(selectedDayTransactions) { tx ->
                     val amountText = formatSignedAmount(tx.amount, tx.type)
@@ -975,7 +1160,7 @@ fun HomeCalendarTab(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onSelectTransaction(tx) }   // 클릭 시 수정 화면으로 이동
+                            .clickable { onSelectTransaction(tx) }   // 메인 내역 수정으로 이동
                             .padding(vertical = 6.dp)
                     ) {
                         Row(
@@ -992,10 +1177,37 @@ fun HomeCalendarTab(
                             )
                         }
                         Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = tx.category,
-                            style = MaterialTheme.typography.bodySmall
-                        )
+
+                        // 카테고리 + 정기결제 뱃지
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Start,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = tx.category,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
+                            if (tx.isRecurring) {
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .border(
+                                            1.dp,
+                                            MaterialTheme.colorScheme.primary,
+                                            RoundedCornerShape(4.dp)
+                                        )
+                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                ) {
+                                    Text(
+                                        text = "정기결제",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                        }
                     }
                     Divider()
                 }
@@ -1003,6 +1215,8 @@ fun HomeCalendarTab(
         }
     }
 }
+
+
 
 // 수입/지출 타입을 선택하는 토글 버튼. 지출/수입 두 버튼에서 재사용된다.
 @Composable
@@ -1044,7 +1258,6 @@ fun AddTransactionScreen(
     val db = remember { FirebaseFirestore.getInstance() }
     val uid = auth.currentUser?.uid
 
-    // 금액, 메모, 타입, 카테고리, 날짜 입력 상태
     var amountText by remember { mutableStateOf("") }
     var memo by remember { mutableStateOf("") }
 
@@ -1058,24 +1271,41 @@ fun AddTransactionScreen(
         mutableStateOf<Long?>(System.currentTimeMillis())
     }
 
-    // 선택된 날짜를 텍스트로 표시
     val formattedDate = remember(selectedDateMillis) {
         val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
         selectedDateMillis?.let { sdf.format(Date(it)) } ?: "날짜 선택"
     }
 
-    // 카테고리 선택용 바텀시트 상태
+    // 정기결제 관련 상태
+    var isRecurring by remember { mutableStateOf(false) }                 // 일반/정기결제 토글
+    var recurringInterval by remember { mutableStateOf("monthly") }      // "weekly", "monthly", "yearly"
+    var hasEndDate by remember { mutableStateOf(false) }                 // 마감일 사용 여부
+    var endDateMillis by remember { mutableStateOf<Long?>(null) }
+
+    val formattedEndDate = remember(hasEndDate, endDateMillis) {
+        if (!hasEndDate || endDateMillis == null) {
+            "없음"
+        } else {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+            sdf.format(Date(endDateMillis!!))
+        }
+    }
+
     var showCategorySheet by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
 
-    // 날짜 선택용 DatePicker 상태
     var showDatePicker by remember { mutableStateOf(false) }
     val datePickerState = rememberDatePickerState(
         initialSelectedDateMillis = selectedDateMillis ?: System.currentTimeMillis()
     )
 
-    // readOnly/disabled TextField를 일반 TextField처럼 보이게 만들기 위한 색상 오버라이드
+    // 정기결제 마감일용 DatePicker
+    var showEndDatePicker by remember { mutableStateOf(false) }
+    val endDatePickerState = rememberDatePickerState(
+        initialSelectedDateMillis = endDateMillis ?: System.currentTimeMillis()
+    )
+
     val disabledLikeEnabledColors = OutlinedTextFieldDefaults.colors(
         disabledTextColor = MaterialTheme.colorScheme.onSurface,
         disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1084,7 +1314,6 @@ fun AddTransactionScreen(
         disabledContainerColor = MaterialTheme.colorScheme.surface
     )
 
-    // Firestore에서 사용자 정의 카테고리 불러오기
     LaunchedEffect(uid) {
         if (uid == null) return@LaunchedEffect
 
@@ -1149,7 +1378,6 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 금액 입력. 숫자만 허용.
         OutlinedTextField(
             value = amountText,
             onValueChange = { amountText = it.filter { ch -> ch.isDigit() } },
@@ -1160,7 +1388,6 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 메모 입력
         OutlinedTextField(
             value = memo,
             onValueChange = { memo = it },
@@ -1171,7 +1398,7 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 카테고리 선택 영역 (실제 TextField는 disabled, 상위 Box가 클릭을 받는다)
+        // 카테고리 선택
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1193,7 +1420,7 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 날짜 선택 영역 (DatePicker 다이얼로그 호출)
+        // 거래 날짜 선택
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1213,9 +1440,129 @@ fun AddTransactionScreen(
             )
         }
 
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // 일반 / 정기결제 토글
+        Text(
+            text = "결제 유형",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            TypeToggleButton(
+                text = "일반",
+                selected = !isRecurring,
+                onClick = {
+                    isRecurring = false
+                    hasEndDate = false
+                    endDateMillis = null
+                },
+                modifier = Modifier.weight(1f)
+            )
+
+            TypeToggleButton(
+                text = "정기 결제",
+                selected = isRecurring,
+                onClick = { isRecurring = true },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        if (isRecurring) {
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 주기 선택 (주 / 월 / 년)
+            Text(
+                text = "반복 주기",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                TypeToggleButton(
+                    text = "주",
+                    selected = recurringInterval == "weekly",
+                    onClick = { recurringInterval = "weekly" },
+                    modifier = Modifier.weight(1f)
+                )
+                TypeToggleButton(
+                    text = "월",
+                    selected = recurringInterval == "monthly",
+                    onClick = { recurringInterval = "monthly" },
+                    modifier = Modifier.weight(1f)
+                )
+                TypeToggleButton(
+                    text = "년",
+                    selected = recurringInterval == "yearly",
+                    onClick = { recurringInterval = "yearly" },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 마감일 설정
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("마감일")
+                    Text(
+                        text = "기본은 '없음'이고, 설정한 경우에만 적용돼.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(
+                    checked = hasEndDate,
+                    onCheckedChange = { checked ->
+                        hasEndDate = checked
+                        if (!checked) {
+                            endDateMillis = null
+                        }
+                    }
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .let {
+                        if (hasEndDate) it.clickable { showEndDatePicker = true }
+                        else it
+                    }
+            ) {
+                OutlinedTextField(
+                    value = formattedEndDate,
+                    onValueChange = {},
+                    label = { Text("마감일") },
+                    readOnly = true,
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = {
+                        if (hasEndDate) {
+                            Icon(Icons.Default.CalendarToday, contentDescription = null)
+                        }
+                    },
+                    colors = disabledLikeEnabledColors
+                )
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
 
-        // 저장 버튼. 입력 값 검증 후 Firestore에 문서 추가.
         Button(
             onClick = {
                 if (uid == null) {
@@ -1236,13 +1583,21 @@ fun AddTransactionScreen(
 
                 val ts = Timestamp(Date(selectedDateMillis ?: System.currentTimeMillis()))
 
-                val data = mapOf(
+                val data = mutableMapOf<String, Any>(
                     "amount" to amount,
                     "type" to type,
                     "memo" to memo,
                     "category" to selectedCategory,
-                    "date" to ts
+                    "date" to ts,
+                    "isRecurring" to isRecurring
                 )
+
+                if (isRecurring) {
+                    data["recurringInterval"] = recurringInterval
+                    if (hasEndDate && endDateMillis != null) {
+                        data["recurringEndDate"] = Timestamp(Date(endDateMillis!!))
+                    }
+                }
 
                 db.collection("users")
                     .document(uid)
@@ -1263,13 +1618,11 @@ fun AddTransactionScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 취소 버튼 (홈으로 복귀)
         TextButton(onClick = onCancel) {
             Text("취소")
         }
     }
 
-    // 카테고리 선택 모달 바텀시트
     if (showCategorySheet) {
         ModalBottomSheet(
             onDismissRequest = { showCategorySheet = false },
@@ -1299,7 +1652,7 @@ fun AddTransactionScreen(
         }
     }
 
-    // 날짜 선택 다이얼로그 (Material 3 DatePicker)
+    // 거래 날짜 선택
     if (showDatePicker) {
         DatePickerDialog(
             onDismissRequest = { showDatePicker = false },
@@ -1318,6 +1671,29 @@ fun AddTransactionScreen(
             }
         ) {
             DatePicker(state = datePickerState)
+        }
+    }
+
+    // 정기결제 마감일 선택
+    if (showEndDatePicker) {
+        DatePickerDialog(
+            onDismissRequest = { showEndDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        endDatePickerState.selectedDateMillis?.let {
+                            endDateMillis = it
+                            hasEndDate = true
+                        }
+                        showEndDatePicker = false
+                    }
+                ) { Text("확인") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEndDatePicker = false }) { Text("취소") }
+            }
+        ) {
+            DatePicker(state = endDatePickerState)
         }
     }
 }
@@ -1367,7 +1743,6 @@ fun EditTransactionScreen(
     val db = remember { FirebaseFirestore.getInstance() }
     val uid = auth.currentUser?.uid
 
-    // 잘못된 진입(트랜잭션 또는 uid 없음) 처리
     if (transaction == null || uid == null) {
         Column(
             modifier = Modifier
@@ -1383,7 +1758,6 @@ fun EditTransactionScreen(
         return
     }
 
-    // 수정 가능한 필드 상태
     var amountText by remember { mutableStateOf(transaction.amount.toString()) }
     var memo by remember { mutableStateOf(transaction.memo) }
 
@@ -1404,7 +1778,27 @@ fun EditTransactionScreen(
         selectedDateMillis?.let { sdf.format(Date(it)) } ?: "날짜 선택"
     }
 
-    // 카테고리 시트 및 DatePicker 상태
+    // 정기결제 관련 상태 (추가 화면과 동일한 구조)
+    var isRecurring by remember { mutableStateOf(transaction.isRecurring) }
+    var recurringInterval by remember {
+        mutableStateOf(transaction.recurringInterval ?: "monthly")
+    }
+    var hasEndDate by remember {
+        mutableStateOf(transaction.recurringEndDate != null)
+    }
+    var endDateMillis by remember {
+        mutableStateOf<Long?>(transaction.recurringEndDate?.toDate()?.time)
+    }
+
+    val formattedEndDate = remember(hasEndDate, endDateMillis) {
+        if (!hasEndDate || endDateMillis == null) {
+            "없음"
+        } else {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+            sdf.format(Date(endDateMillis!!))
+        }
+    }
+
     var showCategorySheet by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
@@ -1414,7 +1808,11 @@ fun EditTransactionScreen(
         initialSelectedDateMillis = selectedDateMillis ?: System.currentTimeMillis()
     )
 
-    // disabled TextField를 일반 TextField처럼 보이게 하기 위한 색상 설정
+    var showEndDatePicker by remember { mutableStateOf(false) }
+    val endDatePickerState = rememberDatePickerState(
+        initialSelectedDateMillis = endDateMillis ?: System.currentTimeMillis()
+    )
+
     val disabledLikeEnabledColors = OutlinedTextFieldDefaults.colors(
         disabledTextColor = MaterialTheme.colorScheme.onSurface,
         disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1423,7 +1821,6 @@ fun EditTransactionScreen(
         disabledContainerColor = MaterialTheme.colorScheme.surface
     )
 
-    // Firestore에서 카테고리 로드
     LaunchedEffect(uid) {
         if (uid == null) return@LaunchedEffect
 
@@ -1464,7 +1861,6 @@ fun EditTransactionScreen(
                     }
                 },
                 actions = {
-                    // 상단 삭제 아이콘. 문서 삭제 후 onDeleted 콜백 호출.
                     IconButton(
                         onClick = {
                             db.collection("users")
@@ -1513,7 +1909,6 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // 금액 수정
             OutlinedTextField(
                 value = amountText,
                 onValueChange = { amountText = it.filter { ch -> ch.isDigit() } },
@@ -1524,7 +1919,6 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 메모 수정
             OutlinedTextField(
                 value = memo,
                 onValueChange = { memo = it },
@@ -1535,7 +1929,7 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 카테고리 수정 (바텀시트)
+            // 카테고리 수정
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1557,7 +1951,7 @@ fun EditTransactionScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 날짜 수정 (DatePicker)
+            // 날짜 수정
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1577,9 +1971,127 @@ fun EditTransactionScreen(
                 )
             }
 
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // 결제 유형 (일반 / 정기결제)
+            Text(
+                text = "결제 유형",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                TypeToggleButton(
+                    text = "일반",
+                    selected = !isRecurring,
+                    onClick = {
+                        isRecurring = false
+                        hasEndDate = false
+                        endDateMillis = null
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+
+                TypeToggleButton(
+                    text = "정기 결제",
+                    selected = isRecurring,
+                    onClick = { isRecurring = true },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            if (isRecurring) {
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    text = "반복 주기",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TypeToggleButton(
+                        text = "주",
+                        selected = recurringInterval == "weekly",
+                        onClick = { recurringInterval = "weekly" },
+                        modifier = Modifier.weight(1f)
+                    )
+                    TypeToggleButton(
+                        text = "월",
+                        selected = recurringInterval == "monthly",
+                        onClick = { recurringInterval = "monthly" },
+                        modifier = Modifier.weight(1f)
+                    )
+                    TypeToggleButton(
+                        text = "년",
+                        selected = recurringInterval == "yearly",
+                        onClick = { recurringInterval = "yearly" },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("마감일")
+                        Text(
+                            text = "기본은 '없음'이고, 설정한 경우에만 적용돼.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = hasEndDate,
+                        onCheckedChange = { checked ->
+                            hasEndDate = checked
+                            if (!checked) {
+                                endDateMillis = null
+                            }
+                        }
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .let {
+                            if (hasEndDate) it.clickable { showEndDatePicker = true }
+                            else it
+                        }
+                ) {
+                    OutlinedTextField(
+                        value = formattedEndDate,
+                        onValueChange = {},
+                        label = { Text("마감일") },
+                        readOnly = true,
+                        enabled = false,
+                        modifier = Modifier.fillMaxWidth(),
+                        trailingIcon = {
+                            if (hasEndDate) {
+                                Icon(Icons.Default.CalendarToday, contentDescription = null)
+                            }
+                        },
+                        colors = disabledLikeEnabledColors
+                    )
+                }
+            }
+
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 저장 버튼. 변경된 필드를 Firestore에 update.
             Button(
                 onClick = {
                     val amount = amountText.toLongOrNull() ?: 0
@@ -1590,13 +2102,21 @@ fun EditTransactionScreen(
 
                     val ts = Timestamp(Date(selectedDateMillis ?: System.currentTimeMillis()))
 
-                    val data = mapOf(
+                    val data = mutableMapOf<String, Any>(
                         "amount" to amount,
                         "memo" to memo,
                         "category" to selectedCategory,
                         "type" to type,
-                        "date" to ts
+                        "date" to ts,
+                        "isRecurring" to isRecurring
                     )
+
+                    if (isRecurring) {
+                        data["recurringInterval"] = recurringInterval
+                        if (hasEndDate && endDateMillis != null) {
+                            data["recurringEndDate"] = Timestamp(Date(endDateMillis!!))
+                        }
+                    }
 
                     db.collection("users")
                         .document(uid)
@@ -1615,7 +2135,6 @@ fun EditTransactionScreen(
         }
     }
 
-    // 카테고리 선택 시트
     if (showCategorySheet) {
         ModalBottomSheet(
             onDismissRequest = { showCategorySheet = false },
@@ -1645,7 +2164,6 @@ fun EditTransactionScreen(
         }
     }
 
-    // 날짜 선택 다이얼로그
     if (showDatePicker) {
         DatePickerDialog(
             onDismissRequest = { showDatePicker = false },
@@ -1666,7 +2184,30 @@ fun EditTransactionScreen(
             DatePicker(state = datePickerState)
         }
     }
+
+    if (showEndDatePicker) {
+        DatePickerDialog(
+            onDismissRequest = { showEndDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        endDatePickerState.selectedDateMillis?.let {
+                            endDateMillis = it
+                            hasEndDate = true
+                        }
+                        showEndDatePicker = false
+                    }
+                ) { Text("확인") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEndDatePicker = false }) { Text("취소") }
+            }
+        ) {
+            DatePicker(state = endDatePickerState)
+        }
+    }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
