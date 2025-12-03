@@ -52,6 +52,8 @@ import kotlinx.coroutines.launch
 import java.util.Calendar
 import java.util.Date
 import kotlin.math.abs
+import androidx.compose.material.icons.filled.Flag
+import androidx.compose.ui.draw.clip
 
 // 공통 날짜 포맷 함수 (Timestamp -> yyyy-MM-dd)
 fun formatDate(ts: Timestamp?): String {
@@ -247,6 +249,24 @@ data class CategoryTotal(
     val total: Long
 )
 
+data class GoalItem(
+    val id: String,
+    val name: String,
+    val targetAmount: Long,
+    val category: String,
+    val deadline: Timestamp?,
+    val currentAmount: Long
+)
+
+data class GoalRecordItem(
+    val id: String,
+    val amount: Long,
+    val memo: String,
+    val type: String,          // "add" 또는 "withdraw"
+    val date: Timestamp?,
+    val goalName: String = ""  // 홈 탭 표기를 위한 목표 이름
+)
+
 // 앱 엔트리 포인트 Activity
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -265,6 +285,7 @@ class MainActivity : ComponentActivity() {
 
                 var screen by remember { mutableStateOf("login") }
                 var selectedTransaction by remember { mutableStateOf<TransactionItem?>(null) }
+                var selectedGoal by remember { mutableStateOf<GoalItem?>(null) }
 
                 Surface(
                     modifier = Modifier.fillMaxSize(),
@@ -291,6 +312,10 @@ class MainActivity : ComponentActivity() {
                             onSelectTransaction = { tx ->
                                 selectedTransaction = tx
                                 screen = "edit"
+                            },
+                            onOpenGoalDetail = { goal ->
+                                selectedGoal = goal
+                                screen = "goal_detail"
                             }
                         )
 
@@ -320,6 +345,11 @@ class MainActivity : ComponentActivity() {
 
                         "about" -> AboutAppScreen(
                             onBack = { screen = "settings" }
+                        )
+
+                        "goal_detail" -> GoalDetailScreen(
+                            goal = selectedGoal,
+                            onBack = { screen = "home" }
                         )
                     }
                 }
@@ -544,7 +574,8 @@ fun HomeScreen(
     onAddTransaction: () -> Unit = {},
     onOpenCalendar: () -> Unit = {},
     onOpenSettings: () -> Unit = {},
-    onSelectTransaction: (TransactionItem) -> Unit = {}
+    onSelectTransaction: (TransactionItem) -> Unit = {},
+    onOpenGoalDetail: (GoalItem) -> Unit = {}
 ) {
     val context = LocalContext.current
     val auth = remember { FirebaseAuth.getInstance() }
@@ -553,6 +584,9 @@ fun HomeScreen(
 
     var transactions by remember { mutableStateOf<List<TransactionItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(false) }
+
+    var goalRecords by remember { mutableStateOf<List<GoalRecordItem>>(emptyList()) }
+    var goalRecordsLoading by remember { mutableStateOf(false) }
 
     val now = remember { Calendar.getInstance() }
     var selectedYear by remember { mutableStateOf(now.get(Calendar.YEAR)) }
@@ -618,12 +652,65 @@ fun HomeScreen(
         }
     }
 
+    DisposableEffect(uid) {
+        if (uid == null) {
+            goalRecords = emptyList()
+            onDispose { }
+        } else {
+            goalRecordsLoading = true
+
+            val registration = FirebaseFirestore.getInstance()
+                .collectionGroup("records")
+                .addSnapshotListener { snapshot, e ->
+                    if (e != null) {
+                        goalRecordsLoading = false
+                        Log.e("HomeScreen", "goal records snapshot error", e)
+                        Toast.makeText(
+                            context,
+                            "목표 기록을 불러오는 중 오류가 발생했습니다.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@addSnapshotListener
+                    }
+
+                    if (snapshot != null) {
+                        goalRecords = snapshot.documents.map { doc ->
+                            GoalRecordItem(
+                                id = doc.id,
+                                amount = doc.getLong("amount") ?: 0L,
+                                memo = doc.getString("memo") ?: "",
+                                type = doc.getString("type") ?: "add",
+                                date = doc.getTimestamp("date"),
+                                goalName = doc.getString("goalName") ?: ""
+                            )
+                        }
+                        goalRecordsLoading = false
+                    }
+                }
+
+            onDispose {
+                registration.remove()
+            }
+        }
+    }
+
     val filteredTransactions = remember(transactions, selectedYear, selectedMonth) {
         expandTransactionsForMonth(
             baseTransactions = transactions,
             year = selectedYear,
             month = selectedMonth
         )
+    }
+
+    val goalRecordsForMonth = remember(goalRecords, selectedYear, selectedMonth) {
+        val cal = Calendar.getInstance()
+        goalRecords.filter { r ->
+            val ts = r.date ?: return@filter false
+            val d = ts.toDate()
+            cal.time = d
+            cal.get(Calendar.YEAR) == selectedYear &&
+                    cal.get(Calendar.MONTH) == selectedMonth
+        }.sortedByDescending { it.date?.toDate()?.time ?: 0L }
     }
 
     val incomeTotal = filteredTransactions
@@ -670,6 +757,12 @@ fun HomeScreen(
                     onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Default.CalendarMonth, contentDescription = "캘린더") },
                     label = { Text("캘린더") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 3,
+                    onClick = { selectedTab = 3 },
+                    icon = { Icon(Icons.Default.Flag, contentDescription = "목표") },
+                    label = { Text("목표") }
                 )
             }
         }
@@ -729,8 +822,10 @@ fun HomeScreen(
                     filteredTransactions = filteredTransactions,
                     isLoading = isLoading,
                     onAddTransaction = onAddTransaction,
-                    onSelectTransaction = onSelectTransaction
+                    onSelectTransaction = onSelectTransaction,
+                    goalRecords = goalRecordsForMonth
                 )
+
 
                 1 -> HomeCategoryTab(
                     monthTransactions = filteredTransactions,
@@ -742,7 +837,12 @@ fun HomeScreen(
                     month = selectedMonth,
                     monthLabel = monthLabel,
                     monthTransactions = filteredTransactions,
+                    goalRecords = goalRecordsForMonth,
                     onSelectTransaction = onSelectTransaction
+                )
+
+                3 -> GoalsTab(
+                    onOpenGoalDetail = onOpenGoalDetail
                 )
             }
         }
@@ -782,7 +882,8 @@ fun HomeMainTab(
     filteredTransactions: List<TransactionItem>,
     isLoading: Boolean,
     onAddTransaction: () -> Unit,
-    onSelectTransaction: (TransactionItem) -> Unit
+    onSelectTransaction: (TransactionItem) -> Unit,
+    goalRecords: List<GoalRecordItem>
 ) {
     val monthNumber = monthLabel.substring(5, 7).toInt()
 
@@ -806,31 +907,33 @@ fun HomeMainTab(
 
         Spacer(modifier = Modifier.height(18.dp))
 
-        Text(
-            text = "상세 내역",
-            style = MaterialTheme.typography.titleMedium,
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        when {
-            isLoading -> {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    CircularProgressIndicator()
+        if (isLoading) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize()
+            ) {
+                // 1) 상세 내역 헤더
+                item {
+                    Text(
+                        text = "상세 내역",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
                 }
-            }
 
-            filteredTransactions.isEmpty() -> {
-                Text("이 달 등록된 내역이 없습니다.")
-            }
-
-            else -> {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize()
-                ) {
+                // 2) 일반 내역 리스트 또는 "없음" 메시지
+                if (filteredTransactions.isEmpty()) {
+                    item {
+                        Text("이 달 등록된 내역이 없습니다.")
+                    }
+                } else {
                     items(filteredTransactions) { tx ->
                         val displayDate = tx.occurrenceDate ?: tx.date
 
@@ -905,6 +1008,75 @@ fun HomeMainTab(
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
+                        }
+                        Divider()
+                    }
+                }
+
+                // 3) 목표 입출금 내역 헤더
+                item {
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(
+                        text = "목표 입출금 내역",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (goalRecords.isEmpty()) {
+                        Text(
+                            text = "이 달에는 목표 입출금 기록이 없습니다.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                // 4) 목표 입출금 기록 리스트
+                if (goalRecords.isNotEmpty()) {
+                    items(goalRecords) { r ->
+                        val sign = if (r.type == "add") "+" else "-"
+                        val color =
+                            if (r.type == "add") MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        text = r.memo.ifBlank { "메모 없음" },
+                                        style = MaterialTheme.typography.bodyLarge
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = if (r.goalName.isBlank())
+                                            "목표: 이름 없음"
+                                        else
+                                            "목표: ${r.goalName}",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+
+                                Text(
+                                    text = "$sign${"%,d".format(r.amount)}원",
+                                    color = color
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(2.dp))
+
+                            Text(
+                                text = formatDate(r.date),
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         }
                         Divider()
                     }
@@ -1089,6 +1261,7 @@ fun HomeCalendarTab(
     month: Int,
     monthLabel: String,
     monthTransactions: List<TransactionItem>,
+    goalRecords: List<GoalRecordItem>,
     onSelectTransaction: (TransactionItem) -> Unit
 ) {
     val dailyTotals: Map<Int, Long> = remember(monthTransactions) {
@@ -1111,6 +1284,16 @@ fun HomeCalendarTab(
         if (selectedDay == null) emptyList()
         else monthTransactions.filter { tx ->
             val ts = (tx.occurrenceDate ?: tx.date) ?: return@filter false
+            val cal = Calendar.getInstance().apply { time = ts.toDate() }
+            cal.get(Calendar.DAY_OF_MONTH) == selectedDay
+        }
+    }
+
+    // 선택된 날짜의 목표 입출금 기록
+    val selectedDayGoalRecords = remember(goalRecords, selectedDay) {
+        if (selectedDay == null) emptyList()
+        else goalRecords.filter { r ->
+            val ts = r.date ?: return@filter false
             val cal = Calendar.getInstance().apply { time = ts.toDate() }
             cal.get(Calendar.DAY_OF_MONTH) == selectedDay
         }
@@ -1225,76 +1408,640 @@ fun HomeCalendarTab(
 
     Spacer(modifier = Modifier.height(8.dp))
 
-    when {
-        selectedDay != null && selectedDayTransactions.isEmpty() -> {
-            Text("이 날짜에는 등록된 내역이 없습니다.")
+    if (selectedDay == null) {
+        Text(
+            text = "아래 캘린더에서 날짜를 선택하시면 해당 날짜의 내역이 표시됩니다.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        return
+    }
+
+    if (selectedDayTransactions.isEmpty() && selectedDayGoalRecords.isEmpty()) {
+        Text("이 날짜에는 등록된 내역이 없습니다.")
+        return
+    }
+
+    LazyColumn {
+        // 1) 일반 내역 섹션
+        item {
+            Text(
+                text = "상세 내역",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(modifier = Modifier.height(8.dp))
         }
 
-        selectedDayTransactions.isNotEmpty() -> {
-            LazyColumn {
-                items(selectedDayTransactions) { tx ->
-                    val effectiveType =
-                        if (tx.type.isBlank()) "expense" else tx.type
-                    val amountText = formatSignedAmount(tx.amount, effectiveType)
-                    val amountColor =
-                        if (effectiveType == "income") MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.error
+        if (selectedDayTransactions.isEmpty()) {
+            item {
+                Text(
+                    text = "이 날짜에는 일반 내역이 없습니다.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        } else {
+            items(selectedDayTransactions) { tx ->
+                val effectiveType =
+                    if (tx.type.isBlank()) "expense" else tx.type
+                val amountText = formatSignedAmount(tx.amount, effectiveType)
+                val amountColor =
+                    if (effectiveType == "income") MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error
 
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelectTransaction(tx) }
-                            .padding(vertical = 6.dp)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelectTransaction(tx) }
+                        .padding(vertical = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = tx.memo.ifBlank { "메모 없음" },
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-                            Text(
-                                text = amountText,
-                                color = amountColor
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = tx.memo.ifBlank { "메모 없음" },
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                        Text(
+                            text = amountText,
+                            color = amountColor
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(2.dp))
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Start,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = tx.category,
-                                style = MaterialTheme.typography.bodySmall
-                            )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Start,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = tx.category,
+                            style = MaterialTheme.typography.bodySmall
+                        )
 
-                            if (tx.isRecurring) {
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .border(
-                                            1.dp,
-                                            MaterialTheme.colorScheme.primary,
-                                            RoundedCornerShape(4.dp)
-                                        )
-                                        .padding(horizontal = 4.dp, vertical = 1.dp)
-                                ) {
-                                    Text(
-                                        text = "정기결제",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary
+                        if (tx.isRecurring) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Box(
+                                modifier = Modifier
+                                    .border(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.primary,
+                                        RoundedCornerShape(4.dp)
                                     )
-                                }
+                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                            ) {
+                                Text(
+                                    text = "정기결제",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
                             }
                         }
                     }
-                    Divider()
+                }
+                Divider()
+            }
+        }
+
+        // 2) 목표 입출금 내역 섹션
+        item {
+            Spacer(modifier = Modifier.height(32.dp))
+            Text(
+                text = "목표 입출금 내역",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            if (selectedDayGoalRecords.isEmpty()) {
+                Text(
+                    text = "이 날짜에는 목표 입출금 기록이 없습니다.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+
+        if (selectedDayGoalRecords.isNotEmpty()) {
+            items(selectedDayGoalRecords) { r ->
+                val sign = if (r.type == "add") "+" else "-"
+                val color =
+                    if (r.type == "add") MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = r.memo.ifBlank { "메모 없음" },
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = if (r.goalName.isBlank())
+                                    "목표: 이름 없음"
+                                else
+                                    "목표: ${r.goalName}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+
+                        Text(
+                            text = "$sign${"%,d".format(r.amount)}원",
+                            color = color
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(2.dp))
+
+                    Text(
+                        text = formatDate(r.date),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Divider()
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GoalsTab(
+    onOpenGoalDetail: (GoalItem) -> Unit
+) {
+    val context = LocalContext.current
+    val auth = remember { FirebaseAuth.getInstance() }
+    val db = remember { FirebaseFirestore.getInstance() }
+    val uid = auth.currentUser?.uid
+
+    var goals by remember { mutableStateOf<List<GoalItem>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(false) }
+
+    var showAddDialog by remember { mutableStateOf(false) }
+    var newName by remember { mutableStateOf("") }
+    var newTargetAmountText by remember { mutableStateOf("") }
+    var newCategory by remember { mutableStateOf("") }
+
+    var newDeadlineMillis by remember { mutableStateOf<Long?>(null) }
+    var showDeadlinePicker by remember { mutableStateOf(false) }
+    val deadlinePickerState = rememberDatePickerState(
+        initialSelectedDateMillis = System.currentTimeMillis()
+    )
+
+    var categories by remember { mutableStateOf(defaultCategories()) }
+    var categoryLoading by remember { mutableStateOf(false) }
+    var selectedCategoryForNewGoal by remember { mutableStateOf("기타") }
+
+    var showCategorySheet by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scope = rememberCoroutineScope()
+
+    val formattedDeadline = remember(newDeadlineMillis) {
+        if (newDeadlineMillis == null) {
+            "마감일 없음"
+        } else {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+            sdf.format(Date(newDeadlineMillis!!))
+        }
+    }
+
+    DisposableEffect(uid) {
+        if (uid == null) {
+            goals = emptyList()
+            onDispose { }
+        } else {
+            isLoading = true
+
+            val registration = db.collection("users")
+                .document(uid)
+                .collection("goals")
+                .addSnapshotListener { snapshot, e ->
+                    if (e != null) {
+                        isLoading = false
+                        Log.e("GoalsTab", "snapshot error", e)
+                        Toast.makeText(
+                            context,
+                            "목표를 불러오는 중 오류가 발생했습니다.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@addSnapshotListener
+                    }
+
+                    if (snapshot != null) {
+                        goals = snapshot.documents.map { doc ->
+                            GoalItem(
+                                id = doc.id,
+                                name = doc.getString("name") ?: "",
+                                targetAmount = doc.getLong("targetAmount") ?: 0L,
+                                category = doc.getString("category") ?: "",
+                                deadline = doc.getTimestamp("deadline"),
+                                currentAmount = doc.getLong("currentAmount") ?: 0L
+                            )
+                        }
+                        isLoading = false
+                    }
+                }
+
+            onDispose {
+                registration.remove()
+            }
+        }
+    }
+
+    LaunchedEffect(uid) {
+        if (uid == null) return@LaunchedEffect
+
+        categoryLoading = true
+
+        val docRef = db.collection("users")
+            .document(uid)
+            .collection("settings")
+            .document("categories")
+
+        docRef.get()
+            .addOnSuccessListener { doc ->
+                val itemsAny = doc.get("items") as? List<*>
+                val items = itemsAny
+                    ?.mapNotNull { it as? String }
+                    ?.distinct()
+                    ?.filter { it.isNotBlank() }
+
+                categories = if (!items.isNullOrEmpty()) items else defaultCategories()
+
+                if (!categories.contains(selectedCategoryForNewGoal)) {
+                    selectedCategoryForNewGoal = categories.firstOrNull() ?: "기타"
+                }
+
+                categoryLoading = false
+            }
+            .addOnFailureListener {
+                categories = defaultCategories()
+                categoryLoading = false
+            }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp)
+    ) {
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "목표",
+                style = MaterialTheme.typography.titleMedium
+            )
+
+            Button(
+                onClick = { showAddDialog = true }
+            ) {
+                Text("목표 추가")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        when {
+            uid == null -> {
+                Text("로그인 후 목표를 관리하실 수 있습니다.")
+            }
+
+            isLoading -> {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator()
+                }
+            }
+
+            goals.isEmpty() -> {
+                Text("등록된 목표가 없습니다. \"목표 추가\" 버튼을 눌러 새 목표를 만들어 보세요.")
+            }
+
+            else -> {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    items(goals) { goal ->
+                        GoalListItem(
+                            goal = goal,
+                            onClick = { onOpenGoalDetail(goal) },
+                            onDelete = {
+                                if (uid == null) return@GoalListItem
+
+                                db.collection("users")
+                                    .document(uid)
+                                    .collection("goals")
+                                    .document(goal.id)
+                                    .delete()
+                                    .addOnSuccessListener {
+                                        Toast.makeText(
+                                            context,
+                                            "목표가 삭제되었습니다.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                    .addOnFailureListener { ex ->
+                                        Toast.makeText(
+                                            context,
+                                            "목표 삭제 중 오류가 발생했습니다: ${ex.localizedMessage}",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                            }
+                        )
+                        Divider()
+                    }
                 }
             }
         }
+    }
+
+    if (showAddDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddDialog = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (uid == null) {
+                            Toast.makeText(context, "로그인 후 이용해 주세요.", Toast.LENGTH_SHORT).show()
+                            return@TextButton
+                        }
+
+                        val name = newName.trim()
+                        val targetAmount = newTargetAmountText.toLongOrNull() ?: 0L
+                        val category = newCategory.trim()
+
+                        if (name.isEmpty()) {
+                            Toast.makeText(context, "목표 이름을 입력해 주세요.", Toast.LENGTH_SHORT).show()
+                            return@TextButton
+                        }
+                        if (targetAmount <= 0) {
+                            Toast.makeText(
+                                context,
+                                "목표 금액은 0원보다 커야 합니다.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@TextButton
+                        }
+
+                        val data = mutableMapOf<String, Any>(
+                            "name" to name,
+                            "targetAmount" to targetAmount,
+                            "category" to category,
+                            "currentAmount" to 0L
+                        )
+
+                        if (newDeadlineMillis != null) {
+                            data["deadline"] = Timestamp(Date(newDeadlineMillis!!))
+                        }
+
+                        db.collection("users")
+                            .document(uid)
+                            .collection("goals")
+                            .add(data)
+                            .addOnSuccessListener {
+                                Toast.makeText(
+                                    context,
+                                    "목표가 추가되었습니다.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                newName = ""
+                                newTargetAmountText = ""
+                                newDeadlineMillis = null
+                                // 카테고리는 기본값으로 리셋 (있으면 첫 번째, 없으면 "기타")
+                                selectedCategoryForNewGoal = categories.firstOrNull() ?: "기타"
+                                showAddDialog = false
+                            }
+                            .addOnFailureListener { ex ->
+                                Toast.makeText(
+                                    context,
+                                    "목표 추가 중 오류가 발생했습니다: ${ex.localizedMessage}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                    }
+                ) {
+                    Text("저장")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDialog = false }) {
+                    Text("취소")
+                }
+            },
+            title = { Text("새 목표 추가") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        label = { Text("목표 이름") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = newTargetAmountText,
+                        onValueChange = { newTargetAmountText = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("목표 금액 (원)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !categoryLoading) { showCategorySheet = true }
+                    ) {
+                        OutlinedTextField(
+                            value = selectedCategoryForNewGoal,
+                            onValueChange = {},
+                            label = { Text("카테고리") },
+                            readOnly = true,
+                            enabled = false,
+                            modifier = Modifier.fillMaxWidth(),
+                            trailingIcon = {
+                                Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                                disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledBorderColor = MaterialTheme.colorScheme.outline,
+                                disabledTrailingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledContainerColor = MaterialTheme.colorScheme.surface
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showDeadlinePicker = true }
+                    ) {
+                        OutlinedTextField(
+                            value = formattedDeadline,
+                            onValueChange = {},
+                            label = { Text("마감일 (선택)") },
+                            readOnly = true,
+                            enabled = false,
+                            modifier = Modifier.fillMaxWidth(),
+                            trailingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.CalendarToday,
+                                    contentDescription = null
+                                )
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                                disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledBorderColor = MaterialTheme.colorScheme.outline,
+                                disabledTrailingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledContainerColor = MaterialTheme.colorScheme.surface
+                            )
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    if (showDeadlinePicker) {
+        DatePickerDialog(
+            onDismissRequest = { showDeadlinePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        deadlinePickerState.selectedDateMillis?.let {
+                            newDeadlineMillis = it
+                        }
+                        showDeadlinePicker = false
+                    }
+                ) {
+                    Text("확인")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeadlinePicker = false }) {
+                    Text("취소")
+                }
+            }
+        ) {
+            DatePicker(state = deadlinePickerState)
+        }
+    }
+
+    if (showCategorySheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showCategorySheet = false },
+            sheetState = sheetState
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Text("카테고리 선택", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+
+                if (categoryLoading) {
+                    CircularProgressIndicator()
+                } else {
+                    categories.forEach { cat ->
+                        ListItem(
+                            headlineContent = { Text(cat) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedCategoryForNewGoal = cat
+                                    scope.launch { sheetState.hide() }
+                                        .invokeOnCompletion { showCategorySheet = false }
+                                }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun GoalListItem(
+    goal: GoalItem,
+    onClick: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val deadlineText = formatDate(goal.deadline)
+    val currentText = "%,d원".format(goal.currentAmount)
+    val targetText = "%,d원".format(goal.targetAmount)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(vertical = 8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    text = goal.name.ifBlank { "이름 없는 목표" },
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = if (goal.category.isBlank()) "카테고리 없음" else goal.category,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = if (goal.deadline == null) "마감일 없음" else "마감일: $deadlineText",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            IconButton(onClick = onDelete) {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = "목표 삭제"
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = "$currentText / $targetText",
+            style = MaterialTheme.typography.bodySmall
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        GoalProgressBar(
+            currentAmount = goal.currentAmount,
+            targetAmount = goal.targetAmount
+        )
     }
 }
 
@@ -1766,6 +2513,45 @@ fun AddTransactionScreen(
         ) {
             DatePicker(state = endDatePickerState)
         }
+    }
+}
+
+@Composable
+fun GoalProgressBar(
+    currentAmount: Long,
+    targetAmount: Long,
+    modifier: Modifier = Modifier
+) {
+    val progress = remember(currentAmount, targetAmount) {
+        if (targetAmount <= 0L) 0f
+        else {
+            val ratio = currentAmount.toFloat() / targetAmount.toFloat()
+            ratio.coerceIn(0f, 1f)
+        }
+    }
+
+    val percentText = if (targetAmount <= 0L) {
+        "0%"
+    } else {
+        "${(progress * 100).toInt()}%"
+    }
+
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        LinearProgressIndicator(
+            progress = progress,
+            modifier = Modifier
+                .weight(1f)
+                .height(8.dp)
+                .clip(RoundedCornerShape(50))
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = percentText,
+            style = MaterialTheme.typography.bodyMedium
+        )
     }
 }
 
@@ -2596,8 +3382,8 @@ fun CategorySettingsScreen(
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    val versionName = "1.3.1"
-    val versionCode = 8
+    val versionName = "1.4.0"
+    val versionCode = 9
 
     Scaffold(
         topBar = {
@@ -2657,11 +3443,658 @@ fun AboutAppScreen(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "• 정기결제 기능이 추가되었습니다.\n" +
-                        "• 이제 화면 상단 날짜 선택을 캘린더를 통해 더 쉽게 할 수 있습니다.\n" +
-                        "• 이제 카테고리 탭에서 정기결제 목록을 확인할 수 있습니다.",
+                text = "• 목표기능이 추가되었습니다.",
                 style = MaterialTheme.typography.bodyMedium
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GoalDetailScreen(
+    goal: GoalItem?,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val auth = remember { FirebaseAuth.getInstance() }
+    val db = remember { FirebaseFirestore.getInstance() }
+    val uid = auth.currentUser?.uid
+
+    if (goal == null || uid == null) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("목표 상세") },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "뒤로")
+                        }
+                    }
+                )
+            }
+        ) { innerPadding ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("목표 정보를 불러오는 중 문제가 발생했습니다.")
+            }
+        }
+        return
+    }
+
+    var records by remember { mutableStateOf<List<GoalRecordItem>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(false) }
+
+    var currentAmount by remember { mutableStateOf(goal.currentAmount) }
+
+    var showAddDialog by remember { mutableStateOf(false) }
+    var addType by remember { mutableStateOf("add") }  // "add" 또는 "withdraw"
+    var addAmountText by remember { mutableStateOf("") }
+    var addMemo by remember { mutableStateOf("") }
+    var addDateMillis by remember { mutableStateOf<Long?>(System.currentTimeMillis()) }
+    var showAddDatePicker by remember { mutableStateOf(false) }
+    val addDatePickerState = rememberDatePickerState(
+        initialSelectedDateMillis = addDateMillis ?: System.currentTimeMillis()
+    )
+
+    var editingRecord by remember { mutableStateOf<GoalRecordItem?>(null) }
+    var editType by remember { mutableStateOf("add") }
+    var editAmountText by remember { mutableStateOf("") }
+    var editMemo by remember { mutableStateOf("") }
+    var editDateMillis by remember { mutableStateOf<Long?>(null) }
+    var showEditDatePicker by remember { mutableStateOf(false) }
+    val editDatePickerState = rememberDatePickerState(
+        initialSelectedDateMillis = editDateMillis ?: System.currentTimeMillis()
+    )
+
+    // 기록 실시간 구독 + currentAmount 재계산
+    DisposableEffect(uid, goal.id) {
+        isLoading = true
+
+        val registration = db.collection("users")
+            .document(uid)
+            .collection("goals")
+            .document(goal.id)
+            .collection("records")
+            .orderBy("date", Query.Direction.DESCENDING)
+            .addSnapshotListener { snapshot, e ->
+                if (e != null) {
+                    isLoading = false
+                    Log.e("GoalDetailScreen", "records snapshot error", e)
+                    Toast.makeText(
+                        context,
+                        "입출금 기록을 불러오는 중 오류가 발생했습니다.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@addSnapshotListener
+                }
+
+                if (snapshot != null) {
+                    val list = snapshot.documents.map { doc ->
+                        GoalRecordItem(
+                            id = doc.id,
+                            amount = doc.getLong("amount") ?: 0L,
+                            memo = doc.getString("memo") ?: "",
+                            type = doc.getString("type") ?: "add",
+                            date = doc.getTimestamp("date")
+                        )
+                    }
+                    records = list
+
+                    val newAmount = list.sumOf { r ->
+                        if (r.type == "withdraw") -r.amount else r.amount
+                    }
+                    currentAmount = newAmount
+
+                    db.collection("users")
+                        .document(uid)
+                        .collection("goals")
+                        .document(goal.id)
+                        .update("currentAmount", newAmount)
+                        .addOnFailureListener { ex ->
+                            Log.e("GoalDetailScreen", "update currentAmount error", ex)
+                        }
+
+                    isLoading = false
+                }
+            }
+
+        onDispose {
+            registration.remove()
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("목표 상세") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "뒤로")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Top,
+            horizontalAlignment = Alignment.Start
+        ) {
+            // 상단 요약 영역
+            Text(
+                text = goal.name,
+                style = MaterialTheme.typography.headlineSmall
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            val deadlineText = formatDate(goal.deadline)
+            Text(
+                text = if (goal.deadline == null) "마감일 없음" else "마감일: $deadlineText",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = if (goal.category.isBlank()) "카테고리: 없음" else "카테고리: ${goal.category}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(
+                text = "달성률",
+                style = MaterialTheme.typography.titleMedium
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            GoalProgressBar(
+                currentAmount = currentAmount,
+                targetAmount = goal.targetAmount
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "%,d원 / %,d원".format(currentAmount, goal.targetAmount),
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+            Divider()
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 입출금 기록 헤더 + 추가 버튼
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "입출금 기록",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Button(onClick = { showAddDialog = true }) {
+                    Text("기록 추가")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            when {
+                isLoading -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                }
+
+                records.isEmpty() -> {
+                    Text(
+                        text = "등록된 입출금 기록이 없습니다. \"기록 추가\" 버튼을 눌러 첫 기록을 만들어 보세요.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                else -> {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    ) {
+                        items(records) { record ->
+                            val sign = if (record.type == "add") "+" else "-"
+                            val color =
+                                if (record.type == "add") MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.error
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        editingRecord = record
+                                        editType = record.type
+                                        editAmountText = record.amount.toString()
+                                        editMemo = record.memo
+                                        editDateMillis =
+                                            record.date?.toDate()?.time ?: System.currentTimeMillis()
+                                    }
+                                    .padding(vertical = 6.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = record.memo.ifBlank { "메모 없음" },
+                                        style = MaterialTheme.typography.bodyLarge
+                                    )
+                                    Text(
+                                        text = "$sign${"%,d".format(record.amount)}원",
+                                        color = color
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = formatDate(record.date),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 기록 추가 다이얼로그
+    if (showAddDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddDialog = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val amount = addAmountText.toLongOrNull() ?: 0L
+                        if (amount <= 0) {
+                            Toast.makeText(
+                                context,
+                                "금액은 0원보다 커야 합니다.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@TextButton
+                        }
+
+                        val dateTs = Timestamp(
+                            Date(addDateMillis ?: System.currentTimeMillis())
+                        )
+
+                        val data = mapOf(
+                            "amount" to amount,
+                            "memo" to addMemo,
+                            "type" to addType,
+                            "date" to dateTs,
+                            "goalName" to goal.name
+                        )
+
+                        db.collection("users")
+                            .document(uid)
+                            .collection("goals")
+                            .document(goal.id)
+                            .collection("records")
+                            .add(data)
+                            .addOnSuccessListener {
+                                Toast.makeText(
+                                    context,
+                                    "기록이 추가되었습니다.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                addAmountText = ""
+                                addMemo = ""
+                                addType = "add"
+                                addDateMillis = System.currentTimeMillis()
+                                showAddDialog = false
+                            }
+                            .addOnFailureListener { ex ->
+                                Toast.makeText(
+                                    context,
+                                    "기록 추가 중 오류가 발생했습니다: ${ex.localizedMessage}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                    }
+                ) {
+                    Text("저장")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDialog = false }) {
+                    Text("취소")
+                }
+            },
+            title = { Text("입출금 기록 추가") },
+            text = {
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TypeToggleButton(
+                            text = "추가",
+                            selected = addType == "add",
+                            onClick = { addType = "add" },
+                            modifier = Modifier.weight(1f)
+                        )
+                        TypeToggleButton(
+                            text = "출금",
+                            selected = addType == "withdraw",
+                            onClick = { addType = "withdraw" },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = addAmountText,
+                        onValueChange = {
+                            addAmountText = it.filter { ch -> ch.isDigit() }
+                        },
+                        label = { Text("금액 (원)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = addMemo,
+                        onValueChange = { addMemo = it },
+                        label = { Text("메모 (선택)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val formattedDate = remember(addDateMillis) {
+                        val sdf = java.text.SimpleDateFormat(
+                            "yyyy-MM-dd",
+                            java.util.Locale.getDefault()
+                        )
+                        sdf.format(Date(addDateMillis ?: System.currentTimeMillis()))
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showAddDatePicker = true }
+                    ) {
+                        OutlinedTextField(
+                            value = formattedDate,
+                            onValueChange = {},
+                            label = { Text("날짜") },
+                            readOnly = true,
+                            enabled = false,
+                            modifier = Modifier.fillMaxWidth(),
+                            trailingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.CalendarToday,
+                                    contentDescription = null
+                                )
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                                disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledBorderColor = MaterialTheme.colorScheme.outline,
+                                disabledTrailingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledContainerColor = MaterialTheme.colorScheme.surface
+                            )
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    // 기록 추가용 날짜 선택
+    if (showAddDatePicker) {
+        DatePickerDialog(
+            onDismissRequest = { showAddDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        addDatePickerState.selectedDateMillis?.let {
+                            addDateMillis = it
+                        }
+                        showAddDatePicker = false
+                    }
+                ) {
+                    Text("확인")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDatePicker = false }) {
+                    Text("취소")
+                }
+            }
+        ) {
+            DatePicker(state = addDatePickerState)
+        }
+    }
+
+    // 기록 수정 다이얼로그
+    if (editingRecord != null) {
+        val record = editingRecord!!
+        AlertDialog(
+            onDismissRequest = { editingRecord = null },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val amount = editAmountText.toLongOrNull() ?: 0L
+                        if (amount <= 0) {
+                            Toast.makeText(
+                                context,
+                                "금액은 0원보다 커야 합니다.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@TextButton
+                        }
+
+                        val dateTs = Timestamp(
+                            Date(editDateMillis ?: System.currentTimeMillis())
+                        )
+
+                        val data = mapOf(
+                            "amount" to amount,
+                            "memo" to editMemo,
+                            "type" to editType,
+                            "date" to dateTs,
+                            "goalName" to goal.name
+                        )
+
+                        db.collection("users")
+                            .document(uid)
+                            .collection("goals")
+                            .document(goal.id)
+                            .collection("records")
+                            .document(record.id)
+                            .update(data)
+                            .addOnSuccessListener {
+                                Toast.makeText(
+                                    context,
+                                    "기록이 수정되었습니다.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                editingRecord = null
+                            }
+                            .addOnFailureListener { ex ->
+                                Toast.makeText(
+                                    context,
+                                    "기록 수정 중 오류가 발생했습니다: ${ex.localizedMessage}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                    }
+                ) {
+                    Text("저장")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            db.collection("users")
+                                .document(uid)
+                                .collection("goals")
+                                .document(goal.id)
+                                .collection("records")
+                                .document(record.id)
+                                .delete()
+                                .addOnSuccessListener {
+                                    Toast.makeText(
+                                        context,
+                                        "기록이 삭제되었습니다.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    editingRecord = null
+                                }
+                                .addOnFailureListener { ex ->
+                                    Toast.makeText(
+                                        context,
+                                        "기록 삭제 중 오류가 발생했습니다: ${ex.localizedMessage}",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                        }
+                    ) {
+                        Text("삭제")
+                    }
+                    TextButton(onClick = { editingRecord = null }) {
+                        Text("취소")
+                    }
+                }
+            },
+            title = { Text("입출금 기록 수정") },
+            text = {
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TypeToggleButton(
+                            text = "추가",
+                            selected = editType == "add",
+                            onClick = { editType = "add" },
+                            modifier = Modifier.weight(1f)
+                        )
+                        TypeToggleButton(
+                            text = "출금",
+                            selected = editType == "withdraw",
+                            onClick = { editType = "withdraw" },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = editAmountText,
+                        onValueChange = {
+                            editAmountText = it.filter { ch -> ch.isDigit() }
+                        },
+                        label = { Text("금액 (원)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = editMemo,
+                        onValueChange = { editMemo = it },
+                        label = { Text("메모 (선택)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val formattedEditDate = remember(editDateMillis) {
+                        val sdf = java.text.SimpleDateFormat(
+                            "yyyy-MM-dd",
+                            java.util.Locale.getDefault()
+                        )
+                        sdf.format(Date(editDateMillis ?: System.currentTimeMillis()))
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showEditDatePicker = true }
+                    ) {
+                        OutlinedTextField(
+                            value = formattedEditDate,
+                            onValueChange = {},
+                            label = { Text("날짜") },
+                            readOnly = true,
+                            enabled = false,
+                            modifier = Modifier.fillMaxWidth(),
+                            trailingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.CalendarToday,
+                                    contentDescription = null
+                                )
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                                disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledBorderColor = MaterialTheme.colorScheme.outline,
+                                disabledTrailingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                disabledContainerColor = MaterialTheme.colorScheme.surface
+                            )
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    // 기록 수정용 날짜 선택
+    if (showEditDatePicker) {
+        DatePickerDialog(
+            onDismissRequest = { showEditDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        editDatePickerState.selectedDateMillis?.let {
+                            editDateMillis = it
+                        }
+                        showEditDatePicker = false
+                    }
+                ) {
+                    Text("확인")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEditDatePicker = false }) {
+                    Text("취소")
+                }
+            }
+        ) {
+            DatePicker(state = editDatePickerState)
         }
     }
 }
