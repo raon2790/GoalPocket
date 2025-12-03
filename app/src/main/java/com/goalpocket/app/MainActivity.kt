@@ -4,7 +4,7 @@ package com.goalpocket.app
 //aTODO: 카테고리 관리
 //aTODO: 다크모드 전환
 //TODO: 친구 추가 및 관리
-//TODO: 개인 목표 저축
+//aTODO: 개인 목표 저축
 //TODO: 공유 목표 저축
 //TODO: 전월/전년 대비 비교
 //TODO: 검색/필터
@@ -1604,6 +1604,9 @@ fun GoalsTab(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
 
+    var goalPendingDelete by remember { mutableStateOf<GoalItem?>(null) }
+    var isDeletingGoal by remember { mutableStateOf(false) }
+
     val formattedDeadline = remember(newDeadlineMillis) {
         if (newDeadlineMillis == null) {
             "마감일 없음"
@@ -1688,6 +1691,52 @@ fun GoalsTab(
             }
     }
 
+    fun deleteGoalWithRecords(goal: GoalItem) {
+        if (uid == null) return
+
+        val goalRef = db.collection("users")
+            .document(uid)
+            .collection("goals")
+            .document(goal.id)
+
+        isDeletingGoal = true
+
+        goalRef.collection("records")
+            .get()
+            .addOnSuccessListener { snapshot ->
+                db.runBatch { batch ->
+                    snapshot.documents.forEach { doc ->
+                        batch.delete(doc.reference)
+                    }
+                    batch.delete(goalRef)
+                }.addOnSuccessListener {
+                    isDeletingGoal = false
+                    Toast.makeText(
+                        context,
+                        "목표와 연결된 입출금 기록이 모두 삭제되었습니다.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }.addOnFailureListener { e ->
+                    isDeletingGoal = false
+                    Log.e("GoalsTab", "delete goal batch error", e)
+                    Toast.makeText(
+                        context,
+                        "목표 삭제 중 오류가 발생했습니다: ${e.localizedMessage}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            .addOnFailureListener { e ->
+                isDeletingGoal = false
+                Log.e("GoalsTab", "load records for delete error", e)
+                Toast.makeText(
+                    context,
+                    "목표의 입출금 기록을 불러오는 중 오류가 발생했습니다.",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1741,27 +1790,9 @@ fun GoalsTab(
                             goal = goal,
                             onClick = { onOpenGoalDetail(goal) },
                             onDelete = {
-                                if (uid == null) return@GoalListItem
-
-                                db.collection("users")
-                                    .document(uid)
-                                    .collection("goals")
-                                    .document(goal.id)
-                                    .delete()
-                                    .addOnSuccessListener {
-                                        Toast.makeText(
-                                            context,
-                                            "목표가 삭제되었습니다.",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    }
-                                    .addOnFailureListener { ex ->
-                                        Toast.makeText(
-                                            context,
-                                            "목표 삭제 중 오류가 발생했습니다: ${ex.localizedMessage}",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    }
+                                // 예전: 여기서 바로 Firestore delete 호출
+                                // 새로: 확인 다이얼로그를 띄우기 위해 상태만 설정
+                                goalPendingDelete = goal
                             }
                         )
                         Divider()
@@ -1978,6 +2009,48 @@ fun GoalsTab(
                 }
             }
         }
+    }
+
+    if (goalPendingDelete != null) {
+        val target = goalPendingDelete!!
+        AlertDialog(
+            onDismissRequest = {
+                if (!isDeletingGoal) {
+                    goalPendingDelete = null
+                }
+            },
+            title = { Text("목표를 삭제하시겠습니까?") },
+            text = {
+                Text(
+                    "이 목표를 삭제하시면 해당 목표에 등록된 입출금 기록도 함께 삭제됩니다.\n" +
+                            "삭제하신 내용은 되돌릴 수 없습니다."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (!isDeletingGoal) {
+                            goalPendingDelete = null
+                            deleteGoalWithRecords(target)
+                        }
+                    },
+                    enabled = !isDeletingGoal
+                ) {
+                    Text("삭제")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        if (!isDeletingGoal) {
+                            goalPendingDelete = null
+                        }
+                    }
+                ) {
+                    Text("취소")
+                }
+            }
+        )
     }
 }
 
@@ -3382,8 +3455,8 @@ fun CategorySettingsScreen(
 fun AboutAppScreen(
     onBack: () -> Unit = {}
 ) {
-    val versionName = "1.4.0"
-    val versionCode = 9
+    val versionName = "1.4.1"
+    val versionCode = 10
 
     Scaffold(
         topBar = {
@@ -3954,6 +4027,7 @@ fun GoalDetailScreen(
             },
             dismissButton = {
                 Row {
+                    // 이 기록(GoalRecordItem)만 삭제
                     TextButton(
                         onClick = {
                             db.collection("users")
@@ -3980,8 +4054,12 @@ fun GoalDetailScreen(
                                 }
                         }
                     ) {
-                        Text("삭제")
+                        Text(
+                            text = "삭제",
+                            color = MaterialTheme.colorScheme.error
+                        )
                     }
+
                     TextButton(onClick = { editingRecord = null }) {
                         Text("취소")
                     }
